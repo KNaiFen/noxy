@@ -12,9 +12,9 @@ Voxy 将远景分为 L0～L4：一个 L0 体素约对应 1 个方块，往上每
 
 ## 安装与使用
 
-明确兼容 **Minecraft 1.20.1、Forge 47.4.0～47.x、Java 21**。客户端需要本项目 **0.2.16**、配套的 **[Voxy Forge 1.20.1](https://github.com/KNaiFen/voxy-forge-1.20.1) 0.2.15-beta** 和 **Embeddium 0.3.31**；专用服务器只安装本项目 0.2.16，不安装 Voxy 或 Embeddium。客户端和服务器必须使用**同一版 Voxy Distant JAR**：0.2.16 的网络协议为 12，不与 0.2.15 扩展混用。JAR、Mod ID 与配置文件仍沿用 `voxy-distant` / `voxy_distant` 名称。
+明确兼容 **Minecraft 1.20.1、Forge 47.4.0～47.x、Java 21**。客户端安装本项目 **0.2.16**、[Voxy Forge 1.20.1 0.2.15-beta](https://github.com/KNaiFen/voxy-forge-1.20.1/actions/runs/35514129065)（在构建页面下载 `voxy-forge-1.20.1` 产物；[源码仓库](https://github.com/KNaiFen/voxy-forge-1.20.1)）和 [Embeddium 0.3.31](https://modrinth.com/mod/embeddium/version/UTbfe5d1)；专用服务器只安装本项目 0.2.16。JAR、Mod ID 与配置文件仍沿用 `voxy-distant` / `voxy_distant` 名称。
 
-从 [0.2.16 发行页](https://github.com/KNaiFen/noxy/releases/tag/0.2.16) 下载 `voxy-distant-0.2.16-forge-1.20.1.jar`；Voxy 和 Embeddium 请从各自渠道获取。已有 `.voxy` 和服务端 LOD 缓存无需清理。安装后即可使用默认设置；在原版“选项”页点击与 Distant Horizons 按钮同位置的 **VD** 小按钮进行设置。OP 等级 2 可在其中在线调整服务器设置。两端配置文件分别为 `config/voxy_distant.toml`。
+从 [0.2.16 发行页](https://github.com/KNaiFen/noxy/releases/tag/0.2.16) 下载 `voxy-distant-0.2.16-forge-1.20.1.jar`。已有 `.voxy` 和服务端 LOD 缓存无需清理。安装后即可使用默认设置；在原版“选项”页点击与 Distant Horizons 按钮同位置的 **VD** 小按钮进行设置。OP 等级 2 可在其中在线调整服务器设置。两端配置文件分别为 `config/voxy_distant.toml`。
 
 源码构建需要 Java 21 及与上述 Voxy 版本匹配的开发命名空间 JAR：`./gradlew build -PvoxyJar=/你的路径/voxy-dev.jar`。开发 JAR 不随本仓库分发，也不能用于游戏安装。
 
