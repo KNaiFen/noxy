@@ -16,7 +16,9 @@ Voxy 将远景分为 L0～L4：一个 L0 体素约对应 1 个方块，往上每
 
 从 [0.2.16 发行页](https://github.com/KNaiFen/noxy/releases/tag/0.2.16) 下载 `voxy-distant-0.2.16-forge-1.20.1.jar`。已有 `.voxy` 和服务端 LOD 缓存无需清理。安装后即可使用默认设置；在原版“选项”页点击与 Distant Horizons 按钮同位置的 **VD** 小按钮进行设置。OP 等级 2 可在其中在线调整服务器设置。两端配置文件分别为 `config/voxy_distant.toml`。
 
-源码构建需要 Java 21 及与上述 Voxy 版本匹配的开发命名空间 JAR：`./gradlew build -PvoxyJar=/你的路径/voxy-dev.jar`。开发 JAR 不随本仓库分发，也不能用于游戏安装。
+普通玩家只需下载并安装上面列出的 JAR，**不需要自行编译**。
+
+如果要从源码编译 Noxy，先在上述 Voxy Forge 源码仓库运行 `./gradlew :1.20.1-forge:jar`，取得 `versions/1.20.1-forge/build/devlibs/voxy-0.2.15-beta+1.20.1-legacyforge.jar`。这是供 Noxy **编译**使用的开发 JAR，不能用上面下载的 Voxy 游戏安装 JAR 代替。然后切到 Noxy 源码根目录，使用 Java 21 运行 `./gradlew build -PvoxyJar=开发JAR的绝对路径`；把等号后面换成刚生成的文件的实际完整路径。编译出的 Noxy 安装 JAR 位于 `build/libs/`。Windows 可将 `./gradlew` 换成 `./gradlew.bat`。
 
 ## 致谢与许可
 
