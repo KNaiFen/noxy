@@ -1,0 +1,27 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+[[mods]]
+modId="voxy_distant"
+version="0.2.16-forge-1.20.1"
+displayName="Voxy Distant"
+displayTest="IGNORE_ALL_VERSION"
+description='''Distant generation, server LOD streaming and progressive Voxy rendering. Java 21.'''
+[[dependencies.voxy_distant]]
+modId="forge"
+mandatory=true
+versionRange="[47.4.0,48)"
+ordering="NONE"
+side="BOTH"
+[[dependencies.voxy_distant]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1]"
+ordering="NONE"
+side="BOTH"
+[[dependencies.voxy_distant]]
+modId="voxy"
+mandatory=true
+versionRange="[0.2.15-beta]"
+ordering="AFTER"
+side="CLIENT"

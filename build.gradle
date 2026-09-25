@@ -1,0 +1,145 @@
+plugins {
+    id 'java'
+    id 'net.neoforged.moddev.legacyforge' version '2.0.141'
+}
+
+group = 'dev.voxydistant'
+version = '0.2.16-forge-1.20.1'
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+base.archivesName = 'voxy-distant'
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://api.modrinth.com/maven' }
+}
+sourceSets {
+    smoke { compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath }
+}
+
+legacyForge {
+    version = '1.20.1-47.4.20'
+    runs {
+        client { client() }
+        server { server(); programArgument '--nogui' }
+        if (providers.gradleProperty('clientSmoke').isPresent()) {
+            data {
+                data()
+                systemProperty 'voxyDistant.clientSmoke', 'true'
+                programArguments.addAll('--mod', 'distant_smoke', '--all', '--output', 'generated-smoke')
+            }
+        }
+    }
+    mods {
+        voxy_distant { sourceSet sourceSets.main }
+        if (providers.gradleProperty('clientSmoke').isPresent()) {
+            distant_smoke { sourceSet sourceSets.smoke }
+        }
+    }
+}
+
+def voxyJar = providers.gradleProperty('voxyJar').orElse('.materials/voxy-compat-build/versions/1.20.1-forge/build/devlibs/voxy-0.2.15-beta+1.20.1-legacyforge.jar')
+dependencies {
+    // A named (development) Voxy JAR from the pinned checkout, never bundled.
+    compileOnly files(voxyJar)
+    testImplementation files(voxyJar)
+    modCompileOnly 'maven.modrinth:embeddium:0.3.31+mc1.20.1'
+    if (providers.gradleProperty('clientSmoke').isPresent() || providers.gradleProperty('lodClient').isPresent()) {
+        runtimeOnly files(voxyJar)
+        modRuntimeOnly 'maven.modrinth:embeddium:0.3.31+mc1.20.1'
+    }
+    if (providers.gradleProperty('lodBenchmark').isPresent()) {
+        modRuntimeOnly 'maven.modrinth:chunky:4FTDk9wv'
+    }
+    compileOnly 'org.spongepowered:mixin:0.8.7'
+    annotationProcessor 'org.spongepowered:mixin:0.8.7:processor'
+    compileOnly 'io.github.llamalad7:mixinextras-common:0.5.4'
+    jarJar(implementation('io.github.llamalad7:mixinextras-forge:0.5.4'))
+    jarJar(implementation('org.rocksdb:rocksdbjni:10.2.1'))
+    jarJar(implementation('com.github.luben:zstd-jni:1.5.7-6'))
+    // Forge's development module layer only discovers plain libraries via this configuration.
+    if (!providers.gradleProperty('clientSmoke').isPresent() && !providers.gradleProperty('lodClient').isPresent()) {
+        additionalRuntimeClasspath 'org.rocksdb:rocksdbjni:10.2.1'
+        additionalRuntimeClasspath 'com.github.luben:zstd-jni:1.5.7-6'
+    }
+    if (providers.gradleProperty('lodClient').isPresent()) {
+        additionalRuntimeClasspath 'com.github.luben:zstd-jni:1.5.7-6'
+    }
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testImplementation 'org.ow2.asm:asm-tree:9.7.1'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+tasks.register('writeClientLaunch') {
+    dependsOn 'prepareClientRun'
+    doLast {
+        def run = tasks.named('runClient').get()
+        def java = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(21) }.get().executablePath.asFile.absolutePath
+        def folders = "voxy_distant%%${layout.buildDirectory.dir('classes/java/main').get().asFile};voxy_distant%%${layout.buildDirectory.dir('resources/main').get().asFile}"
+        def classpath = sourceSets.main.output.files + configurations.runtimeClasspath.files + configurations.additionalRuntimeClasspath.files + configurations.matching { it.name.toLowerCase().contains('devlaunch') }.collectMany { it.files }
+        def args = [java] + run.allJvmArgs + ['-cp', classpath.collect { it.absolutePath }.join(File.pathSeparator), run.mainClass.get()] + run.args
+        layout.buildDirectory.file('client-launch.json').get().asFile.text = groovy.json.JsonOutput.toJson([args: args, mod_classes: folders])
+    }
+}
+mixin {
+    add sourceSets.main, 'voxy_distant.refmap.json'
+    config 'voxy_distant.mixins.json'
+}
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+tasks.named('test') { useJUnitPlatform() }
+sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
+sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
+tasks.named('jar') {
+    manifest.attributes('MixinConfigs': 'voxy_distant.mixins.json')
+}
+// Keep one distributable for Windows x64, Linux x64/ARM64, and macOS ARM64.
+// Trim only JarJar's staging copies; the resolved development dependencies stay intact.
+tasks.named('jarJar') {
+    def nativeFiles = [
+        'rocksdbjni-10.2.1.jar': [
+            'librocksdbjni-win64.dll',
+            'librocksdbjni-linux64.so', 'librocksdbjni-linux64-musl.so',
+            'librocksdbjni-linux-aarch64.so', 'librocksdbjni-linux-aarch64-musl.so',
+            'librocksdbjni-osx-arm64.jnilib'
+        ],
+        'zstd-jni-1.5.7-6.jar': [
+            'win/amd64/libzstd-jni-1.5.7-6.dll',
+            'linux/amd64/libzstd-jni-1.5.7-6.so',
+            'linux/aarch64/libzstd-jni-1.5.7-6.so',
+            'darwin/aarch64/libzstd-jni-1.5.7-6.dylib'
+        ]
+    ]
+    inputs.property('nativeFiles', nativeFiles)
+    doLast {
+        nativeFiles.each { name, keep ->
+            def jar = outputDirectory.file("META-INF/jarjar/${name}").get().asFile.toPath()
+            def temporary = jar.resolveSibling(name + '.tmp')
+            new java.util.zip.ZipFile(jar.toFile()).withCloseable { source ->
+                keep.each { path ->
+                    if (source.getEntry(path) == null) throw new GradleException("Missing native library: ${name}!/${path}")
+                }
+                new java.util.zip.ZipOutputStream(java.nio.file.Files.newOutputStream(temporary)).withCloseable { target ->
+                    source.entries().each { entry ->
+                        if (!(entry.name ==~ /.*\.(dll|so|dylib|jnilib)/) || keep.contains(entry.name)) {
+                            def copy = new java.util.zip.ZipEntry(entry.name)
+                            copy.time = entry.time
+                            target.putNextEntry(copy)
+                            source.getInputStream(entry).withCloseable { it.transferTo(target) }
+                            target.closeEntry()
+                        }
+                    }
+                }
+            }
+            java.nio.file.Files.move(temporary, jar, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
+}
+tasks.register('writeSmokeLaunch') {
+    dependsOn 'prepareServerRun', 'smokeClasses'
+    doLast {
+        def run = tasks.named('runServer').get()
+        def java = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(21) }.get().executablePath.asFile.absolutePath
+        def folders = "voxy_distant%%${layout.buildDirectory.dir('classes/java/main').get().asFile};voxy_distant%%${layout.buildDirectory.dir('resources/main').get().asFile}"
+        def classpath = sourceSets.main.output.files + configurations.runtimeClasspath.files + configurations.additionalRuntimeClasspath.files + configurations.matching { it.name.toLowerCase().contains('devlaunch') }.collectMany { it.files }
+        def args = [java] + run.allJvmArgs + ['-cp', classpath.collect { it.absolutePath }.join(File.pathSeparator), run.mainClass.get()] + run.args
+        layout.buildDirectory.file('smoke-launch.json').get().asFile.text = groovy.json.JsonOutput.toJson([args: args, mod_classes: folders])
+    }
+}

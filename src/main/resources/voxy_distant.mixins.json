@@ -1,0 +1,10 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "dev.voxydistant.compat.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "voxy_distant.refmap.json",
+  "mixins": ["ChunkPriorityMixin", "SorterAccessor", "ServerChunkMapMixin", "ServerBlockMixin", "ServerLightMixin", "VanillaSendMixin", "SectionPacketAccessor", "ConnectionReadMixin"],
+  "client": ["EngineMixin", "InstanceMixin", "UpdaterMixin", "UpdaterAccessor", "SectionAccessor", "MeshMixin", "EmptyMeshMixin", "MeshPriorityMixin", "NodeUpdatesMixin", "NodeStoreMixin", "IngestMixin", "ClientLightMixin", "IdentifierMixin", "NodeCollapseMixin", "BuiltMeshMixin", "SaveMixin", "ShaderLoaderMixin", "SolidBoundsMixin"],
+  "injectors": { "defaultRequire": 1 }
+}
