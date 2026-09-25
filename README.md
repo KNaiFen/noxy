@@ -11,7 +11,7 @@ Voxy Distant 是 Minecraft 1.20.1 / Forge 的远景扩展。单人游戏可在�
 | 客户端 | Voxy Distant、Voxy 0.2.15-beta、Embeddium 0.3.31 |
 | 专用服务器 | 仅 Voxy Distant；不安装 Voxy 或 Embeddium |
 
-本地 `dist/` 提供上述三个 JAR 和 `SHA256SUMS.txt`；GitHub Release 提供公开安装包。`build/devlibs/` 中的开发命名空间 JAR 不能用于游戏安装。已有 `.voxy` 和服务端 LOD 缓存无需清理；升级前正常关闭游戏与服务器，再替换两端扩展。服务器未安装本扩展时客户端仍可连接，但不会进行远景同步。完整兼容条件与升级步骤见本地开发文档中的安装说明。
+本地 `dist/` 提供上述三个 JAR 和 `SHA256SUMS.txt`；GitHub Release 只提供本项目的 Voxy Distant JAR。Voxy 和 Embeddium 需要按各自发布渠道获取。`build/devlibs/` 中的开发命名空间 JAR 不能用于游戏安装。已有 `.voxy` 和服务端 LOD 缓存无需清理；升级前正常关闭游戏与服务器，再替换两端扩展。服务器未安装本扩展时客户端仍可连接，但不会进行远景同步。
 
 ## 开始使用
 
@@ -38,4 +38,4 @@ Voxy Distant 是 Minecraft 1.20.1 / Forge 的远景扩展。单人游戏可在�
 
 ## 开发与文档
 
-使用 Java 21 运行 `./gradlew build` 可从源码构建。公开仓库保留构建文件、产品源码和基础说明；开发测试资料保留在本地开发分支。扩展许可证见[LICENSE](LICENSE)。
+源码构建需要 Java 21 和与 Voxy 0.2.15-beta 匹配的**开发命名空间** JAR；提供 `-PvoxyJar=/你的路径/voxy-dev.jar` 后运行 `./gradlew build`。开发命名空间 JAR 不随本项目公开仓库分发，也不能直接放入游戏 `mods/`。公开仓库保留构建文件、产品源码和基础说明；开发测试资料保留在本地开发分支。扩展许可证见[LICENSE](LICENSE)。
