@@ -1,6 +1,6 @@
 # Noxy / voxy-distant
 
-Noxy（原 voxy-distant）是 [Voxy](https://github.com/MCRcortex/voxy) 的附属 Mod，它让单人游戏在原版视距外生成远景；多人游戏则由服务器生成、缓存远景，客户端按距离取回不同精度的数据，交给 Voxy 显示。靠近时细节逐步补齐，原版区块到达后接管近景。
+Noxy（原 voxy-distant）是 [Voxy](https://github.com/MCRcortex/voxy) 的附属 Mod，也是一个**纯 VibeCoding 项目**。它让 Voxy 除了在本地生成 LOD，还能从多人服务器接收预先生成或缓存的远景。客户端按距离接收所需精度，靠近时再补齐细节；这样减少了需要下载的数据量和服务器出口流量，让 Voxy 远景在多人服务器上更实际可用。
 
 ## 为什么这样传
 
