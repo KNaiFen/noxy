@@ -28,4 +28,4 @@ Voxy 将远景分为 L0～L4：一个 L0 体素约对应 1 个方块，往上每
 ## 致谢与许可
 
 本项目是纯 **VibeCoding** 项目，遵循 [MIT 协议](LICENSE)。
-感谢 GPT、[Distant Horizons](https://gitlab.com/distant-horizons-team/distant-horizons) 和 [Voxy](https://github.com/MCRcortex/voxy)。
+感谢 [GPT（Codex）](https://chatgpt.com/codex)、[Distant Horizons](https://gitlab.com/distant-horizons-team/distant-horizons) 和 [Voxy](https://github.com/MCRcortex/voxy)。
