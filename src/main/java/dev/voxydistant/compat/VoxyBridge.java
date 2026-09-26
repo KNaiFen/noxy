@@ -129,7 +129,9 @@ public final class VoxyBridge {
         }
         for(int l=1;l<=4;l++){
             var parent=world.acquire(l,converted.x>>(l+1),converted.y>>(l+1),converted.z>>(l+1));
-            try{occupancy(parent);world.markDirty(parent,WorldEngine.DEFAULT_UPDATE_FLAGS,63);}finally{parent.release();}
+            // The source section changes only one octant of this 32-block parent.
+            int child=WorldSection.getChildIndex((converted.x>>l)&1,(converted.y>>l)&1,(converted.z>>l)&1);
+            try{occupancy(parent,1<<child);world.markDirty(parent,WorldEngine.DEFAULT_UPDATE_FLAGS,63);}finally{parent.release();}
         }
         }
         for(int l=0;l<=4;l++){
@@ -142,6 +144,18 @@ public final class VoxyBridge {
         int mask=0;long[] data=section._unsafeGetRawDataArray();
         for(int i=0;i<data.length;i++)if(!me.cortex.voxy.common.world.other.Mapper.isAir(data[i]))
             mask|=1<<WorldSection.getChildIndex((i&31)>>4,(i>>10)>>4,((i>>5)&31)>>4);
+        section._unsafeSetNonEmptyChildren((byte)mask);
+    }
+
+    static void occupancy(WorldSection section,int changedChildren) {
+        int mask=section.getNonEmptyChildren()&255;long[] data=section._unsafeGetRawDataArray();
+        for(int bit=0;bit<8;bit++)if((changedChildren&(1<<bit))!=0){
+            int base=((bit&1)<<4)|((bit&2)<<8)|((bit&4)<<12);
+            boolean occupied=false;
+            for(int y=0;y<16&&!occupied;y++)for(int z=0;z<16&&!occupied;z++)
+                for(int x=0;x<16;x++)if(!me.cortex.voxy.common.world.other.Mapper.isAir(data[base+(y<<10)+(z<<5)+x])){occupied=true;break;}
+            mask=occupied?mask|(1<<bit):mask&~(1<<bit);
+        }
         section._unsafeSetNonEmptyChildren((byte)mask);
     }
 

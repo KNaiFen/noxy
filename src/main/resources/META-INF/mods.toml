@@ -3,7 +3,7 @@ loaderVersion="[47,)"
 license="MIT"
 [[mods]]
 modId="voxy_distant"
-version="0.2.16-forge-1.20.1"
+version="0.2.17-forge-1.20.1"
 displayName="Voxy Distant"
 displayTest="IGNORE_ALL_VERSION"
 description='''Distant generation, server LOD streaming and progressive Voxy rendering. Java 21.'''

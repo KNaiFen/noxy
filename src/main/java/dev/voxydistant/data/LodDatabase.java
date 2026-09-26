@@ -149,7 +149,10 @@ public final class LodDatabase implements AutoCloseable {
         } catch (RocksDBException e) { throw new IllegalStateException("LOD column write failed", e); }
     }
     private static long storedVersion(byte[] stored) {
-        return ColumnCodec.decodeLevels(unpack(stored),0).version();
+        var header = ByteBuffer.wrap(ColumnCodec.uncompress(unpack(stored)));
+        if (header.getInt() != 1) throw new IllegalArgumentException("Unknown LOD schema");
+        // Schema, x, z and minY occupy the first four ints.
+        return header.getLong(16);
     }
     private static byte[] keyWithKind(byte[] key, int kind) {
         byte[] result = key.clone(); result[0] = (byte)kind; return result;
