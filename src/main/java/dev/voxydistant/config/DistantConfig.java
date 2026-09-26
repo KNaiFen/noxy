@@ -123,6 +123,12 @@ public final class DistantConfig {
     }
     public static int importThreads() { return IMPORT_THREADS.get()==0?Math.max(1,Math.min(32,Runtime.getRuntime().availableProcessors()-2)):IMPORT_THREADS.get(); }
     public static long importMemory() { return (IMPORT_MEMORY.get()==0?Math.max(64,Math.min(1024,Runtime.getRuntime().maxMemory()/8/1048576)):IMPORT_MEMORY.get())*1048576L; }
+    public static void validateReceiveMemory(int sections,int receiveMiB) {
+        long bytes=sections*dev.voxydistant.generation.ChunkSnapshot.RESERVED_BYTES;
+        long snapshot=Math.min(32L<<20,receiveMiB*1048576L/4);
+        if(bytes>32L<<20)throw new IllegalArgumentException("当前维度的完整区块快照超过 32 MiB 接收快照上限");
+        if(snapshot<bytes)throw new IllegalArgumentException("当前维度的完整区块快照需要 "+((bytes+1048575)/1048576)+" MiB，接收缓冲至少设置 "+((bytes*4+1048575)/1048576)+" MiB");
+    }
     private static Limits limits(Preset preset, Limits custom) {
         int c = Runtime.getRuntime().availableProcessors();
         return switch (preset) {

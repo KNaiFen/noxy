@@ -34,7 +34,7 @@ public final class DistantScreen extends Screen {
             new Setting("接收服务端远景", "接收兼容服务器发送的 LOD 列。", DistantConfig.RECEIVE),
             new Setting("接收半径（区块）", "0 自动跟随 Voxy 渲染距离，仍受服务器上限约束。", DistantConfig.RECEIVE_RADIUS),
             new Setting("下载 KiB/s", "0 自动使用服务器允许的速度，仍受全服和单人上限约束。", DistantConfig.DOWNLOAD_KBPS),
-            new Setting("接收缓冲 MiB", "修改后退出并重新连接服务器生效。", DistantConfig.RECEIVE_MIB),
+            new Setting("接收缓冲 MiB", "当前维度完整区块快照需接收缓冲至少为整列预留的 4 倍；原版主世界需 12 MiB。修改后重连生效。", DistantConfig.RECEIVE_MIB),
             new Setting("索引缓存 MiB", "客户端覆盖索引的内存预算。", DistantConfig.INDEX_MIB),
             new Setting("处理占空比", "远景接收应用线程的工作占比。", DistantConfig.RECEIVE_DUTY),
             new Setting("请求窗口（列）", "最多允许多少列处于未完成请求状态。", DistantConfig.REQUEST_WINDOW));
@@ -140,6 +140,10 @@ public final class DistantScreen extends Screen {
             var spec = DistantConfig.SPEC.getSpec().<ForgeConfigSpec.ValueSpec>get(value.getPath());
             if (!spec.test(result)) { error = setting.label() + "：有效范围 " + spec.getRange(); return; }
             parsed.put(value, result);
+        }
+        if (minecraft.level != null && Boolean.TRUE.equals(parsed.get(DistantConfig.RECEIVE))) {
+            try { DistantConfig.validateReceiveMemory(minecraft.level.getSectionsCount(),(int)parsed.get(DistantConfig.RECEIVE_MIB)); }
+            catch (IllegalArgumentException ex) { error = ex.getMessage(); return; }
         }
         parsed.forEach((value, result) -> ((ForgeConfigSpec.ConfigValue) value).set(result));
         DistantConfig.SPEC.save();

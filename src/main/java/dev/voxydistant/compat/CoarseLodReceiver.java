@@ -58,6 +58,7 @@ public final class CoarseLodReceiver {
                             neighbors|=((column.z()^(column.z()-1))>>(l+1))==0?0:16;
                             neighbors|=((column.z()^(column.z()+1))>>(l+1))==0?0:32;
                         }
+                        if(min>0&&l>0){int child=me.cortex.voxy.common.world.WorldSection.getChildIndex((column.x()>>l)&1,(y>>l)&1,(column.z()>>l)&1);neighbors|=(1<<child)<<8;}
                         touched.merge(target.key,neighbors,(a,b)->a|b);
                     } finally {target.release();}
                 }
@@ -65,7 +66,7 @@ public final class CoarseLodReceiver {
             }
             // Publish the now-complete child masks after coverage counters were updated.
             DebugLog.end(CLIENT_VOXELS,voxels);long publish=DebugLog.start();
-            for(var entry:touched.entrySet()){long key=entry.getKey();var section=world.acquire(key);try{if(section.lvl>0)VoxyBridge.occupancy(section);world.markDirty(section,WorldEngine.DEFAULT_UPDATE_FLAGS,entry.getValue());coverage.awaitingSave(key);world.saveSection(section,true,false);}finally{section.release();}}
+            for(var entry:touched.entrySet()){long key=entry.getKey();var section=world.acquire(key);try{if(section.lvl>0){if(min==0)VoxyBridge.occupancy(section);else VoxyBridge.occupancy(section,entry.getValue()>>>8);}world.markDirty(section,WorldEngine.DEFAULT_UPDATE_FLAGS,entry.getValue()&63);coverage.awaitingSave(key);world.saveSection(section,true,false);}finally{section.release();}}
             DebugLog.end(CLIENT_PUBLISH_SAVE,publish);
             }finally{coverage.meshEnd(world,column.x(),column.z(),column.minY(),column.minY()+column.sections().length);}
         }

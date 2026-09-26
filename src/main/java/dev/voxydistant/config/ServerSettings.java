@@ -37,6 +37,7 @@ public final class ServerSettings {
             if (value == IMPORT_MEMORY) return "0 自动：最大堆的 1/8，限制 64～1024 MiB；显式 64～4096 MiB，仅 NBT/快照预算";
             if (value == PLAYER_KBPS) return "0 自动：不加每人固定上限；仍受全服上传及客户端下载上限约束";
             if (value == RECOVERY_SECONDS) return "0 在健康观察期结束后立即恢复全速；其余值为线性恢复秒数";
+            if (value == PLAYER_SEND_MIB || value == TOTAL_SEND_MIB) return "至少容纳一个整列缓存读取；原版主世界需 3 MiB，更高维度可能更多";
             if (value == BANDS) return "半径:层级，逗号分隔；最后一档延伸至接收边界";
             if (value == SERVER_PRESET) return "CUSTOM 使用下方自定义参数";
             if (value == CONFIG_LANGUAGE) return "auto 跟随系统语言；zh_cn / en_us 在重启后更新配置注释";
