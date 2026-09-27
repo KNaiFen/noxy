@@ -18,12 +18,14 @@ public final class Protocol {
     public static final int FRAGMENT_BYTES = 32768;
     public static long reservation(int total,int raw,int level,int sections){return total+raw*3L+(long)sections*(37448>>(level*3))+(2L<<20);}
     public static long batchReservation(int total,int raw,List<Member> members,int sections){
-        long bytes=total+raw*3L;for(Member m:members)bytes+=(long)sections*(37448>>(m.level()*3))+(2L<<20);return bytes;
+        // The receive worker expands and applies one member at a time.
+        long scratch=0;for(Member m:members)scratch=Math.max(scratch,(long)sections*(37448>>(m.level()*3))+(2L<<20));
+        return total+raw*3L+scratch;
     }
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(new ResourceLocation("voxy_distant", "lod"),
-            () -> "12", Protocol::compatible, Protocol::compatible);
+            () -> "14", Protocol::compatible, Protocol::compatible);
     private static boolean compatible(String version) {
-        return version.equals("12") || version.equals(NetworkRegistry.ABSENT) || version.equals(NetworkRegistry.ACCEPTVANILLA);
+        return version.equals("14") || version.equals(NetworkRegistry.ABSENT) || version.equals(NetworkRegistry.ACCEPTVANILLA);
     }
     public record Hello(UUID world,String dimension, int radius, int minY, int maxY, List<String> bands) {}
     public record Maintenance(boolean paused) {}
@@ -36,7 +38,7 @@ public final class Protocol {
     }
     public record Fragment(int epoch, long transfer, int x, int z, long version, int level, long requestId, boolean compressed,
                            int rawLength, int totalLength, int offset, byte[] bytes) {}
-    public record Reply(int epoch, int x, int z, long version, int level, long requestId, int status) { // 0 current, 1 retry, 2 unavailable
+    public record Reply(int epoch, int x, int z, long version, int level, long requestId, int status) { // 0 current, 1 retry, 2 unavailable, 3 receive budget too small
         public Reply(int epoch,int x,int z,long version,int level,int status){this(epoch,x,z,version,level,0,status);}
     }
     public record Member(int x,int z,long version,int level,long requestId,int rawLength) {

@@ -5,6 +5,7 @@ import dev.voxydistant.DebugLog;
 import static dev.voxydistant.DebugLog.Metric.*;
 import me.cortex.voxy.common.voxelization.VoxelizedSection;
 import me.cortex.voxy.common.world.WorldEngine;
+import me.cortex.voxy.common.world.WorldSection;
 import me.cortex.voxy.common.world.other.Mapper;
 import dev.voxydistant.compat.mixin.UpdaterAccessor;
 import net.minecraft.core.registries.Registries;
@@ -13,10 +14,50 @@ import net.minecraft.resources.ResourceLocation;
 
 /** Network column boundary. The sparse mask never causes fine levels to be manufactured. */
 public final class CoarseLodReceiver {
+    private static final ThreadLocal<VoxelizedSection> BUFFER=ThreadLocal.withInitial(VoxelizedSection::createEmpty);
+    public static final class Batch {
+        private static final int MAX_PENDING=24;
+        private final WorldEngine world;
+        private final CoverageStore coverage;
+        private final java.util.Map<Long,Node> pending=new java.util.HashMap<>();
+        private int columns;
+        public Batch(WorldEngine world){this.world=world;coverage=VoxyBridge.coverage(world);}
+        private void add(java.util.Map<Long,Integer> touched,int min){
+            if(touched.isEmpty())return;
+            if(columns++==0){publish(world,coverage,touched,min);return;}
+            for(var entry:touched.entrySet()){
+                long key=entry.getKey();coverage.awaitingSave(key);
+                var node=pending.get(key);
+                if(node==null){node=new Node(world.acquire(key));pending.put(key,node);}
+                node.neighbors|=entry.getValue()&63;
+                node.children|=entry.getValue()>>>8;
+                node.fullOccupancy|=min==0;
+            }
+            if(columns==8||pending.size()>=MAX_PENDING)flush();
+        }
+        private void flush(){
+            try{for(var node:pending.values()){
+                var section=node.section;
+                if(section.lvl>0){if(node.fullOccupancy)VoxyBridge.occupancy(section);else VoxyBridge.occupancy(section,node.children);}
+                world.markDirty(section,WorldEngine.DEFAULT_UPDATE_FLAGS,node.neighbors);
+                world.saveSection(section,true,false);
+            }}finally{for(var node:pending.values())node.section.release();pending.clear();columns=0;}
+        }
+        public void finish(){synchronized(coverage){flush();}}
+        private static final class Node {
+            final WorldSection section;
+            int neighbors,children;
+            boolean fullOccupancy;
+            Node(WorldSection section){this.section=section;}
+        }
+    }
     public static void receive(WorldEngine world,LodColumn column,RegistryAccess registries) {
         receive(world,column,registries,false);
     }
     public static void receive(WorldEngine world,LodColumn column,RegistryAccess registries,boolean authoritative) {
+        receive(world,column,registries,authoritative,null);
+    }
+    public static void receive(WorldEngine world,LodColumn column,RegistryAccess registries,boolean authoritative,Batch batch) {
         long mapping=DebugLog.start();int min=column.minimumLevel();var mapper=world.getMapper();
         int[] states=new int[column.states().size()],biomes=new int[column.biomes().size()];
         for(int i=0;i<states.length;i++)states[i]=mapper.getIdForBlockState(column.states().get(i));
@@ -30,7 +71,8 @@ public final class CoarseLodReceiver {
             coverage.meshBegin(column.x(),column.z(),column.minY(),column.minY()+column.sections().length);
             try {
             var touched=new java.util.HashMap<Long,Integer>();
-            var vs=VoxelizedSection.createEmpty();
+            // insertLevel reads only the level just written below; other levels may retain old data.
+            var vs=BUFFER.get();
             for(int s=0;s<column.sections().length;s++) {
                 int y=column.minY()+s;
                 if(!coverage.accepts(column.x(),y,column.z(),column.version(),min))continue;
@@ -66,9 +108,20 @@ public final class CoarseLodReceiver {
             }
             // Publish the now-complete child masks after coverage counters were updated.
             DebugLog.end(CLIENT_VOXELS,voxels);long publish=DebugLog.start();
-            for(var entry:touched.entrySet()){long key=entry.getKey();var section=world.acquire(key);try{if(section.lvl>0){if(min==0)VoxyBridge.occupancy(section);else VoxyBridge.occupancy(section,entry.getValue()>>>8);}world.markDirty(section,WorldEngine.DEFAULT_UPDATE_FLAGS,entry.getValue()&63);coverage.awaitingSave(key);world.saveSection(section,true,false);}finally{section.release();}}
+            if(batch==null)publish(world,coverage,touched,min);
+            else batch.add(touched,min);
             DebugLog.end(CLIENT_PUBLISH_SAVE,publish);
             }finally{coverage.meshEnd(world,column.x(),column.z(),column.minY(),column.minY()+column.sections().length);}
+        }
+    }
+    private static void publish(WorldEngine world,CoverageStore coverage,java.util.Map<Long,Integer> touched,int min){
+        for(var entry:touched.entrySet()){
+            long key=entry.getKey();var section=world.acquire(key);
+            try{
+                if(section.lvl>0){if(min==0)VoxyBridge.occupancy(section);else VoxyBridge.occupancy(section,entry.getValue()>>>8);}
+                world.markDirty(section,WorldEngine.DEFAULT_UPDATE_FLAGS,entry.getValue()&63);
+                coverage.awaitingSave(key);world.saveSection(section,true,false);
+            }finally{section.release();}
         }
     }
     private CoarseLodReceiver(){}
