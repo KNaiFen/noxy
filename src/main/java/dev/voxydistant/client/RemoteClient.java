@@ -35,10 +35,11 @@ public final class RemoteClient {
         if(maintenancePaused==message.paused())return;
         maintenancePaused=message.paused();
         Session s=session;if(s==null)return;
-        s.epoch=++sequence;s.generation++;s.pending.clear();s.checked.clear();s.invalid.clear();s.retries.clear();s.fullRetry.clear();
+        s.epoch=++sequence;s.generation++;s.pending.clear();s.checked.clear();s.invalid.clear();s.retries.clear();s.fullRetry.clear();s.deferredDirty.clear();s.deferredReplies.clear();s.deferredSnapshots.clear();
         synchronized(s.assemblies){
             for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();
             for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();
+            s.discardedBatches.clear();
         }
         s.x=Integer.MIN_VALUE;s.scan=null;s.scanHeld=null;
         if(!maintenancePaused)s.fullRetry.addAll(s.versions.keySet());
@@ -51,6 +52,10 @@ public final class RemoteClient {
     private static final class BatchAssembly {
         final Protocol.BatchFragment header;final byte[] bytes;final long reservation;final DebugLog.ReceiveTrace trace;int offset;
         BatchAssembly(Protocol.BatchFragment f,long reservation){header=f;bytes=new byte[f.totalLength()];this.reservation=reservation;trace=new DebugLog.ReceiveTrace(f.epoch(),f.transfer());}
+    }
+    private static final class DiscardedBatch {
+        final int totalLength;int offset;
+        DiscardedBatch(int totalLength,int offset){this.totalLength=totalLength;this.offset=offset;}
     }
     private static final class Pending {
         private final long started,id;private final int desired,generation;
@@ -69,7 +74,10 @@ public final class RemoteClient {
             try{while(!executor.getQueue().offer(task,100,TimeUnit.MILLISECONDS)){
                 if(executor.isShutdown())throw new RejectedExecutionException("LOD receive worker shut down while waiting for capacity");
             }}catch(InterruptedException e){Thread.currentThread().interrupt();throw new RejectedExecutionException("Interrupted while waiting for LOD receive capacity",e);}
-        });
+        }){
+            @Override protected void terminated(){if(releaseOnTermination)engine.releaseRef();}
+        };
+        volatile boolean releaseOnTermination;
         final AtomicLong memory=new AtomicLong();final ConcurrentHashMap<Long,Long> versions=new ConcurrentHashMap<>();
         // Vanilla snapshots must not consume credit already advertised to the server.
         final long receiveLimit=DistantConfig.RECEIVE_MIB.get()*1048576L;
@@ -78,12 +86,19 @@ public final class RemoteClient {
         final AtomicLong snapshotMemory=new AtomicLong();
         final Map<Long,Assembly> assemblies=new HashMap<>();
         final Map<Long,BatchAssembly> batchAssemblies=new HashMap<>(); // guarded by assemblies
+        final Map<Long,DiscardedBatch> discardedBatches=new HashMap<>(); // guarded by assemblies
         final Map<Long,Pending> pending=new ConcurrentHashMap<>();
         final Set<Long> loadedFull=ConcurrentHashMap.newKeySet();
         final Map<Long,Integer> checked=new HashMap<>();
         final Set<Long> invalid=new LinkedHashSet<>();
+        final Map<Long,Integer> budgetInsufficient=new HashMap<>();
         final RetryQueue retries=new RetryQueue();
         final Set<Long> fullRetry=new LinkedHashSet<>();
+        final Map<Long,Long> deferredDirty=new LinkedHashMap<>();
+        final ArrayDeque<Protocol.Reply> deferredReplies=new ArrayDeque<>();
+        final Set<Long> deferredSnapshots=ConcurrentHashMap.newKeySet();
+        boolean checkpointPending;
+        boolean activePending;int activeX,activeZ,activeRadius;
         final DistanceBands bands;volatile int epoch=++sequence;volatile boolean closed;
         NearbyChunks scan;Long scanHeld;int x=Integer.MIN_VALUE,z,radius,view,ticks,generation,scanBudget,requestBudget,preempted;volatile long applied,received;long requestSequence;
         boolean refillQueued;
@@ -92,6 +107,8 @@ public final class RemoteClient {
         long debugReceived,debugApplied,debugTicks;
         final Map<String,Integer> requestStates=new LinkedHashMap<>();
         Session(WorldEngine engine,net.minecraft.client.multiplayer.ClientLevel level,Protocol.Hello hello){this.engine=engine;this.level=level;this.hello=hello;bands=DistanceBands.parse(hello.bands());VoxyBridge.coverage(engine).remote(hello.minY(),hello.maxY(),DistantConfig.INDEX_MIB.get());}
+        // Start the single ordered lane before offering, without waiting for queue space.
+        boolean offer(Runnable task){worker.prestartCoreThread();return !worker.isShutdown()&&worker.getQueue().offer(task);}
     }
     public static UUID worldId(){return greeting==null?null:greeting.world();}
     public static Protocol.Hello greeting(){return greeting;}
@@ -122,6 +139,8 @@ public final class RemoteClient {
             WorldEngine engine=VoxyBridge.acquire(mc.level);if(engine==null)return;session=new Session(engine,mc.level,greeting);session.versions.putAll(initialVersions);session.fullRetry.addAll(initialVersions.keySet());session.fullRetry.addAll(lightReady);initialVersions.clear();
         }
         Session s=session;s.ticks++;
+        if(!s.budgetInsufficient.isEmpty()&&s.ticks%100==0)mc.gui.setOverlayMessage(net.minecraft.network.chat.Component.literal("远景列超出接收信用；请增大接收缓冲后重连，或提高服务端单人发送内存"),false);
+        drainMainWork(s);
         long rateNow=System.nanoTime();
         if(s.rateAt==0){s.rateAt=rateNow;s.rateBytes=s.received;s.rateColumns=s.applied;}
         else if(rateNow-s.rateAt>=TimeUnit.SECONDS.toNanos(1)){
@@ -142,9 +161,10 @@ public final class RemoteClient {
             for(var retry:s.retries.oldest(4))DebugLog.log("CLIENT retry_wait epoch={} x={} z={} desired={} attempts={} urgent={} remaining_ms={}",s.epoch,ChunkPos.getX(retry.position()),ChunkPos.getZ(retry.position()),retry.desired(),retry.attempts(),retry.urgent(),DebugLog.millis(Math.max(0,retry.due()-now)));
             DebugLog.connection("CLIENT",mc.getConnection().getConnection(),mc.player.getUUID());
         }
-        if(s.ticks%20==0)s.worker.execute(()->{long timing=DebugLog.start();try{VoxyBridge.coverage(s.engine).checkpointIfDue(s.engine.storage::flush);}catch(RuntimeException e){failed(s,e);}finally{DebugLog.end(CLIENT_CHECKPOINT,timing);}});
+        if(s.ticks%20==0){s.checkpointPending=true;drainMainWork(s);}
         if(maintenancePaused)return;
-        if(!s.fullRetry.isEmpty()){
+        if(!s.deferredSnapshots.isEmpty()&&s.worker.getQueue().size()<256){for(long p:s.deferredSnapshots)if(s.deferredSnapshots.remove(p))s.fullRetry.add(p);}
+        if(s.deferredDirty.isEmpty()&&!s.fullRetry.isEmpty()){
             var it=s.fullRetry.iterator();
             for(int budget=8;it.hasNext()&&budget>0&&s.worker.getQueue().size()<256;){
                 long p=it.next();var chunk=mc.level.getChunkSource().getChunk(ChunkPos.getX(p),ChunkPos.getZ(p),ChunkStatus.FULL,false);
@@ -154,19 +174,21 @@ public final class RemoteClient {
                 budget--;
             }
         }
+        if(!s.deferredDirty.isEmpty())return;
         int radius=Math.min(s.hello.radius(),VoxyBridge.radiusChunks());if(DistantConfig.RECEIVE_RADIUS.get()>0)radius=Math.min(radius,DistantConfig.RECEIVE_RADIUS.get());
         int x=mc.player.chunkPosition().x,z=mc.player.chunkPosition().z,view=mc.options.renderDistance().get();
         if(s.x!=x||s.z!=z||s.radius!=radius||s.view!=view) {
             if(DebugLog.enabled())DebugLog.log("CLIENT move epoch={} from_x={} from_z={} x={} z={} generation={} radius={} view={}",s.epoch,s.x,s.z,x,z,s.generation+1,radius,view);
             boolean teleport=s.x!=Integer.MIN_VALUE&&(Math.abs((long)x-s.x)>32||Math.abs((long)z-s.z)>32);
             s.x=x;s.z=z;s.radius=radius;s.view=view;s.generation++;s.scan=new NearbyChunks(radius,-1);s.scanHeld=null;s.preempted=0;
-            if(teleport){s.epoch=++sequence;s.pending.clear();s.checked.clear();s.invalid.clear();s.retries.clear();synchronized(s.assemblies){for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();}}
+            if(teleport){s.epoch=++sequence;s.pending.clear();s.checked.clear();s.invalid.clear();s.retries.clear();synchronized(s.assemblies){for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();s.discardedBatches.clear();}}
             s.checked.keySet().removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
             s.versions.keySet().removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
             s.invalid.removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
             s.retries.moved(p->inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)),p->desired(s,p),p->urgent(s,p),System.nanoTime());
             Minecraft.getInstance().execute(()->send(s,List.of()));
-            final int range=radius;s.worker.execute(()->VoxyBridge.coverage(s.engine).active(x,z,range));
+            s.activeX=x;s.activeZ=z;s.activeRadius=radius;s.activePending=true;
+            drainMainWork(s);
         }
         var expired=expireRequests(s,System.nanoTime());
         for(int i=0;i<expired.size();i+=16)send(s,List.of(),expired.subList(i,Math.min(i+16,expired.size())));
@@ -198,7 +220,7 @@ public final class RemoteClient {
         if(session!=s||s.closed||maintenancePaused)return;
         var mc=Minecraft.getInstance();
         int window=DistantConfig.REQUEST_WINDOW.get();
-        s.requestState=mc.isPaused()?"paused":s.pending.size()>=window&&(s.scan==null||s.preempted>=16)?"request_window":s.requestBudget==0?"request_rate":s.memory.get()>DistantConfig.RECEIVE_MIB.get()*1048576L*3/4?"receive_memory":VoxyBridge.backedUp(s.engine)?"voxy_backlog":"scanning";
+        s.requestState=mc.isPaused()?"paused":!s.deferredDirty.isEmpty()||!s.deferredReplies.isEmpty()||s.worker.getQueue().remainingCapacity()==0?"worker_queue":s.pending.size()>=window&&(s.scan==null||s.preempted>=16)?"request_window":s.requestBudget==0?"request_rate":s.memory.get()>DistantConfig.RECEIVE_MIB.get()*1048576L*3/4?"receive_memory":VoxyBridge.backedUp(s.engine)?"voxy_backlog":"scanning";
         if(!s.requestState.equals("scanning")){switch(s.requestState){case "request_window"->DebugLog.count(CLIENT_REQUEST_WINDOW);case "receive_memory"->DebugLog.count(CLIENT_REQUEST_MEMORY);case "voxy_backlog"->DebugLog.count(CLIENT_REQUEST_BACKLOG);}return;}
         var positions=new LinkedHashSet<Long>();
         int batch=Math.min(64,Math.min(s.requestBudget,Math.max(0,window-s.pending.size())+(s.scan==null?0:Math.max(0,16-s.preempted))));
@@ -207,7 +229,7 @@ public final class RemoteClient {
         // Reserve half a request batch for scanning past temporarily missing columns.
         int retryLimit=s.pending.size()>=window?0:s.scan==null?batch:Math.min(batch/2,window-s.pending.size());
         int refillBudget=256;
-        for(var it=s.invalid.iterator();it.hasNext()&&positions.size()<retryLimit&&refillBudget-->0;){long p=it.next();it.remove();if(inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p))&&!s.pending.containsKey(p)&&!s.retries.scheduled(p))positions.add(p);}
+        for(var it=s.invalid.iterator();it.hasNext()&&positions.size()<retryLimit&&refillBudget-->0;){long p=it.next();it.remove();Integer blocked=s.budgetInsufficient.get(p);if(blocked!=null&&desired(s,p)<=blocked)continue;s.budgetInsufficient.remove(p);if(inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p))&&!s.pending.containsKey(p)&&!s.retries.scheduled(p))positions.add(p);}
         long retryNow=System.nanoTime();
         for(int i=0;i<batch&&positions.size()<retryLimit;i++){
             Long p=s.retries.poll(retryNow);if(p==null)break;
@@ -221,6 +243,7 @@ public final class RemoteClient {
             int cx=held==null?s.x+next.x():ChunkPos.getX(held),cz=held==null?s.z+next.z():ChunkPos.getZ(held);long pos=ChunkPos.asLong(cx,cz);int desired=s.bands.select(cx,cz,s.x,s.z);
             // Skip only columns the client actually has; its requested view may exceed the server view.
             if(mc.level.getChunkSource().getChunk(cx,cz,ChunkStatus.FULL,false)!=null){s.loadedFull.add(pos);continue;}
+            Integer blocked=s.budgetInsufficient.get(pos);if(blocked!=null){if(desired<=blocked)continue;s.budgetInsufficient.remove(pos);}
             if(s.pending.containsKey(pos)||s.retries.scheduled(pos)||s.checked.getOrDefault(pos,5)<=desired)continue;
             if(s.pending.size()+positions.size()>=window){
                 var cancel=preempt(s,pos,positions);
@@ -236,7 +259,7 @@ public final class RemoteClient {
         s.requestState="index_lookup";
         DebugLog.count(CLIENT_REQUEST_BATCH);
         long now=System.nanoTime();var issued=new LinkedHashMap<Long,Long>();positions.forEach(p->{long id=++s.requestSequence;s.pending.put(p,new Pending(now,desired(s,p),s.generation,id));issued.put(p,id);});int epoch=s.epoch;
-        s.worker.execute(()->{
+        if(!s.offer(()->{
             long timing=DebugLog.start();try {
                 var wants=new ArrayList<Protocol.Want>();var index=VoxyBridge.coverage(s.engine);
                 for(long p:positions){int cx=ChunkPos.getX(p),cz=ChunkPos.getZ(p);var stamp=index.column(cx,cz,s.hello.minY(),s.hello.maxY());wants.add(new Protocol.Want(cx,cz,stamp.version(),stamp.level(),issued.get(p)));}
@@ -247,7 +270,11 @@ public final class RemoteClient {
                     send(s,wants,cancels);refill(s);
                 }});
             }catch(RuntimeException e){failed(s,e);}finally{DebugLog.end(CLIENT_INDEX,timing);}
-        });
+        })){
+            for(long p:positions){s.pending.remove(p);s.invalid.add(p);}
+            if(!cancels.isEmpty())send(s,List.of(),cancels);
+            s.requestState="worker_queue";
+        }
     }
     private static void refill(Session s){
         if(s.refillQueued)return;
@@ -323,7 +350,7 @@ public final class RemoteClient {
                     cancels.add(new Protocol.Cancel(ChunkPos.getX(other.getKey()),ChunkPos.getZ(other.getKey()),other.getValue().id()));
                 }
                 var single=s.assemblies.remove(transfer);if(single!=null)s.memory.addAndGet(-single.reservation);
-                var batch=s.batchAssemblies.remove(transfer);if(batch!=null)s.memory.addAndGet(-batch.reservation);
+                var batch=s.batchAssemblies.remove(transfer);if(batch!=null){s.memory.addAndGet(-batch.reservation);s.discardedBatches.put(transfer,new DiscardedBatch(batch.bytes.length,batch.offset));}
             }
         }
         return cancels;
@@ -375,8 +402,14 @@ public final class RemoteClient {
         if(DebugLog.verbose())DebugLog.log("CLIENT reply epoch={} x={} z={} request_id={} version={} level={} status={}",r.epoch(),r.x(),r.z(),r.requestId(),r.version(),r.level(),r.status());
         long p=ChunkPos.asLong(r.x(),r.z());
         if(!currentRequest(s,p,r.requestId()))return;
-        if(r.status()==0){var request=s.pending.get(p);synchronized(request){request.applying=true;}s.worker.execute(()->{try{if(!s.closed&&s.epoch==r.epoch())completed(s,r.epoch(),p,r.requestId(),r.version(),"unchanged");}catch(RuntimeException e){failed(s,e);}});return;}
+        if(r.status()==0){var request=s.pending.get(p);synchronized(request){request.applying=true;}s.deferredReplies.add(r);drainMainWork(s);return;}
         s.pending.remove(p);
+        if(r.status()==3){
+            if(r.version()<s.versions.getOrDefault(p,0L)){s.invalid.add(p);s.retries.remove(p);refill(s);return;}
+            if(desired(s,p)>r.level()){s.invalid.add(p);s.retries.remove(p);refill(s);return;}
+            s.budgetInsufficient.put(p,r.level());s.invalid.remove(p);s.retries.remove(p);
+            refill(s);return;
+        }
         if(r.status()==2&&s.level.getChunkSource().getChunk(r.x(),r.z(),ChunkStatus.FULL,false)!=null){s.fullRetry.add(p);s.retries.remove(p);}
         else retry(s,p,r.status()==1?"server_retry":"unavailable");
         refill(s);
@@ -389,9 +422,22 @@ public final class RemoteClient {
             BatchAssembly complete;
             synchronized(s.assemblies){
                 if(s.closed||s.epoch!=f.epoch())return;
+                DiscardedBatch discarded=s.discardedBatches.get(f.transfer());
+                if(discarded!=null){
+                    if(discarded.totalLength!=f.totalLength()||discarded.offset!=f.offset())throw new IllegalArgumentException("Inconsistent discarded batch fragments");
+                    discarded.offset+=f.bytes().length;
+                    if(discarded.offset==discarded.totalLength){s.discardedBatches.remove(f.transfer());Protocol.CHANNEL.sendToServer(new Protocol.Receipt(f.epoch(),f.transfer()));}
+                    return;
+                }
                 BatchAssembly a=s.batchAssemblies.get(f.transfer());
                 if(a==null){
-                    if(f.offset()!=0||f.members().stream().noneMatch(m->currentRequest(s,ChunkPos.asLong(m.x(),m.z()),m.requestId())))return;
+                    if(f.offset()!=0)return;
+                    if(f.members().stream().noneMatch(m->currentRequest(s,ChunkPos.asLong(m.x(),m.z()),m.requestId()))){
+                        int offset=f.bytes().length;
+                        if(offset==f.totalLength())Protocol.CHANNEL.sendToServer(new Protocol.Receipt(f.epoch(),f.transfer()));
+                        else s.discardedBatches.put(f.transfer(),new DiscardedBatch(f.totalLength(),offset));
+                        return;
+                    }
                     ColumnCodec.bounded(f.members().size(),1,BatchCodec.MAX_COLUMNS);long raw=4;var positions=new HashSet<Long>();
                     for(var m:f.members()){
                         ColumnCodec.bounded(m.level(),0,4);ColumnCodec.bounded(m.rawLength(),1,ColumnCodec.MAX_BYTES);raw+=4L+m.rawLength();
@@ -420,7 +466,8 @@ public final class RemoteClient {
                     for(var m:members){if(buffer.remaining()<4||buffer.getInt()!=m.rawLength()||buffer.remaining()<m.rawLength())throw new IllegalArgumentException("Invalid batch column length");buffer.position(buffer.position()+m.rawLength());}
                     if(buffer.hasRemaining())throw new IllegalArgumentException("Trailing batch bytes");
                     buffer.position(4);complete.trace.decode+=DebugLog.end(CLIENT_DECODE,decode);
-                    for(var m:members){
+                    var batch=new CoarseLodReceiver.Batch(s.engine);
+                    try{for(var m:members){
                         if(s.closed||s.epoch!=f.epoch())return;
                         int length=buffer.getInt();byte[] bytes=new byte[length];buffer.get(bytes);
                         decode=DebugLog.start();var column=ColumnCodec.decodeRaw(bytes,31);complete.trace.decode+=DebugLog.end(CLIENT_DECODE,decode);
@@ -429,27 +476,41 @@ public final class RemoteClient {
                         long latest=s.versions.getOrDefault(p,0L);
                         var coverage=VoxyBridge.coverage(s.engine);
                         synchronized(coverage){
-                            if(session==s&&s.epoch==f.epoch()&&currentRequest(s,p,m.requestId())&&!s.loadedFull.contains(p)&&column.version()>=latest){long apply=DebugLog.start();int conflicts=coverage.conflicts(column.x(),column.z(),s.hello.minY(),s.hello.maxY(),column.version());if(conflicts>0){DebugLog.count(CLIENT_OLD_VERSION_REPLACED);if(DebugLog.verbose())DebugLog.log("CLIENT authoritative_replace x={} z={} reply_version={} newer_sections={}",column.x(),column.z(),column.version(),conflicts);}CoarseLodReceiver.receive(s.engine,column,s.level.registryAccess(),true);complete.trace.apply+=DebugLog.end(CLIENT_APPLY,apply);s.applied++;complete.trace.applied++;}
+                            if(session==s&&s.epoch==f.epoch()&&currentRequest(s,p,m.requestId())&&!s.loadedFull.contains(p)&&column.version()>=latest){long apply=DebugLog.start();int conflicts=coverage.conflicts(column.x(),column.z(),s.hello.minY(),s.hello.maxY(),column.version());if(conflicts>0){DebugLog.count(CLIENT_OLD_VERSION_REPLACED);if(DebugLog.verbose())DebugLog.log("CLIENT authoritative_replace x={} z={} reply_version={} newer_sections={}",column.x(),column.z(),column.version(),conflicts);}CoarseLodReceiver.receive(s.engine,column,s.level.registryAccess(),true,batch);complete.trace.apply+=DebugLog.end(CLIENT_APPLY,apply);s.applied++;complete.trace.applied++;}
                         }
                         if(DebugLog.verbose())DebugLog.log("CLIENT column epoch={} transfer={} x={} z={} request_id={} level={} version={} latest={} raw_bytes={} applied={}",f.epoch(),f.transfer(),m.x(),m.z(),m.requestId(),m.level(),m.version(),latest,m.rawLength(),currentRequest(s,p,m.requestId())&&column.version()>=latest);
                         completed(s,f.epoch(),p,m.requestId(),m.version(),"batch");
-                    }
+                    }}finally{batch.finish();}
                     result="ok";
                 }catch(RuntimeException e){result="failed";if(DebugLog.enabled())DebugLog.log("CLIENT failed epoch={} transfer={} error={}",f.epoch(),f.transfer(),e.toString());failed(s,e);}
                 finally{long paced=System.nanoTime();pace(started);complete.trace.applied(started,paced,result);s.memory.addAndGet(-complete.reservation);long receiptQueued=DebugLog.start();Minecraft.getInstance().execute(()->{DebugLog.end(CLIENT_RECEIPT_CONTROL,receiptQueued);if(session==s&&s.epoch==f.epoch()){complete.trace.receipt();Protocol.CHANNEL.sendToServer(new Protocol.Receipt(f.epoch(),f.transfer()));}});}
             });
         }catch(RuntimeException e){failed(s,e);}
     }
-    public static void abort(Protocol.Abort a){Session s=session;if(s==null||s.epoch!=a.epoch())return;synchronized(s.assemblies){Assembly removed=s.assemblies.remove(a.transfer());if(removed!=null){s.memory.addAndGet(-removed.reservation);long p=ChunkPos.asLong(removed.header.x(),removed.header.z());if(currentRequest(s,p,removed.header.requestId())){s.pending.remove(p);s.invalid.add(p);}}BatchAssembly batch=s.batchAssemblies.remove(a.transfer());if(batch!=null){s.memory.addAndGet(-batch.reservation);for(var m:batch.header.members()){long p=ChunkPos.asLong(m.x(),m.z());if(currentRequest(s,p,m.requestId())){s.pending.remove(p);s.invalid.add(p);}}}}Protocol.CHANNEL.sendToServer(new Protocol.Receipt(a.epoch(),a.transfer()));}
+    public static void abort(Protocol.Abort a){Session s=session;if(s==null||s.epoch!=a.epoch())return;synchronized(s.assemblies){s.discardedBatches.remove(a.transfer());Assembly removed=s.assemblies.remove(a.transfer());if(removed!=null){s.memory.addAndGet(-removed.reservation);long p=ChunkPos.asLong(removed.header.x(),removed.header.z());if(currentRequest(s,p,removed.header.requestId())){s.pending.remove(p);s.invalid.add(p);}}BatchAssembly batch=s.batchAssemblies.remove(a.transfer());if(batch!=null){s.memory.addAndGet(-batch.reservation);for(var m:batch.header.members()){long p=ChunkPos.asLong(m.x(),m.z());if(currentRequest(s,p,m.requestId())){s.pending.remove(p);s.invalid.add(p);}}}}Protocol.CHANNEL.sendToServer(new Protocol.Receipt(a.epoch(),a.transfer()));}
     public static void dirty(Protocol.Dirty d) {
         if(greeting==null||!greeting.dimension().equals(d.dimension()))return;
         Session s=session;long pos=ChunkPos.asLong(d.x(),d.z());if(s==null){initialVersions.merge(pos,d.version(),Math::max);return;}
-        s.versions.merge(pos,d.version(),Math::max);s.checked.remove(pos);s.retries.remove(pos);if(!d.vanilla())s.invalid.add(pos);
+        long previous=s.versions.getOrDefault(pos,0L);s.versions.merge(pos,d.version(),Math::max);s.checked.remove(pos);s.retries.remove(pos);if(d.version()>previous)s.budgetInsufficient.remove(pos);if(!d.vanilla())s.invalid.add(pos);
         // A revision applies to the whole column, even when vanilla changed only one section.
         // Recapture loaded columns after the following vanilla packet has run on the main thread.
         s.fullRetry.add(pos);
         // Keep the existing render hierarchy while requiring a fresh revision for cache hits.
-        s.worker.execute(()->{try{var coverage=VoxyBridge.coverage(s.engine);synchronized(coverage){if(!s.closed)coverage.restrict(d.x(),d.z(),s.hello.minY(),s.hello.maxY(),d.version());}}catch(RuntimeException e){failed(s,e);}});
+        s.deferredDirty.merge(pos,d.version(),Math::max);drainMainWork(s);
+    }
+    private static void drainMainWork(Session s){
+        while(!s.deferredDirty.isEmpty()){
+            var entry=s.deferredDirty.entrySet().iterator().next();long p=entry.getKey(),version=entry.getValue();int x=ChunkPos.getX(p),z=ChunkPos.getZ(p);
+            if(!s.offer(()->{try{var coverage=VoxyBridge.coverage(s.engine);synchronized(coverage){if(!s.closed)coverage.restrict(x,z,s.hello.minY(),s.hello.maxY(),version);}}catch(RuntimeException e){failed(s,e);}}))return;
+            s.deferredDirty.remove(p);
+        }
+        while(!s.deferredReplies.isEmpty()){
+            var reply=s.deferredReplies.peek();long p=ChunkPos.asLong(reply.x(),reply.z());
+            if(!s.offer(()->{try{if(!s.closed&&s.epoch==reply.epoch())completed(s,reply.epoch(),p,reply.requestId(),reply.version(),"unchanged");}catch(RuntimeException e){failed(s,e);}}))return;
+            s.deferredReplies.remove();
+        }
+        if(s.activePending){int x=s.activeX,z=s.activeZ,radius=s.activeRadius;if(s.offer(()->VoxyBridge.coverage(s.engine).active(x,z,radius)))s.activePending=false;}
+        if(s.checkpointPending&&s.offer(()->{long timing=DebugLog.start();try{VoxyBridge.coverage(s.engine).checkpointIfDue(s.engine.storage::flush);}catch(RuntimeException e){failed(s,e);}finally{DebugLog.end(CLIENT_CHECKPOINT,timing);}}))s.checkpointPending=false;
     }
     public static boolean handles(WorldEngine world){Session s=session;return s!=null&&!s.closed&&s.engine==world;}
     public static void lightPending(net.minecraft.client.multiplayer.ClientLevel level,int x,int z){
@@ -484,24 +545,27 @@ public final class RemoteClient {
         long p=ChunkPos.asLong(x,z);
         if(lightLevel!=s.level||!lightReady.contains(p)){s.fullRetry.add(p);return;}
         long version=s.versions.getOrDefault(p,0L);if(version==0)return;
+        if(s.worker.getQueue().size()>=256){s.deferredSnapshots.add(p);return;}
         long bytes=ChunkSnapshot.RESERVED_BYTES;if(s.snapshotMemory.addAndGet(bytes)>s.snapshotLimit){s.snapshotMemory.addAndGet(-bytes);Minecraft.getInstance().execute(()->{if(session==s)s.fullRetry.add(ChunkPos.asLong(x,z));});return;}s.memory.addAndGet(bytes);
         var biomes=section.getBiomes().recreate();for(int by=0;by<4;by++)for(int bz=0;bz<4;bz++)for(int bx=0;bx<4;bx++)biomes.getAndSetUnchecked(bx,by,bz,section.getBiomes().get(bx,by,bz));
         var snapshot=new ChunkSnapshot(x,y,z,section.getStates().copy(),biomes,block==null?null:block.copy(),sky==null?null:sky.copy());int epoch=s.epoch;
-        s.worker.execute(()->{
+        if(!s.offer(()->{
             long started=System.nanoTime();try{synchronized(VoxyBridge.coverage(world)){if(!s.closed&&s.epoch==epoch&&version>=s.versions.getOrDefault(ChunkPos.asLong(x,z),0L))VoxyBridge.ingestRemote(world,snapshot,version);}}
             catch(RuntimeException e){failed(s,e);}finally{pace(started);s.memory.addAndGet(-bytes);s.snapshotMemory.addAndGet(-bytes);}
-        });
+        })){
+            s.memory.addAndGet(-bytes);s.snapshotMemory.addAndGet(-bytes);s.deferredSnapshots.add(p);
+        }
     }
     private static void pace(long started){double duty=DistantConfig.RECEIVE_DUTY.get();if(duty<1){long timing=DebugLog.start();java.util.concurrent.locks.LockSupport.parkNanos((long)((System.nanoTime()-started)*(1/duty-1)));DebugLog.end(CLIENT_PACE,timing);}}
     private static void failed(Session s,RuntimeException e){failure=e.toString();LOG.error("Voxy Distant receive failed",e);Minecraft.getInstance().execute(()->{if(session==s){s.radius=0;send(s,List.of());close();greeting=null;}});}
-    public static String status(){if(maintenancePaused)return "服务端正在导入远景";Session s=session;return s==null?(failure.isEmpty()?"无服务端远景会话":failure):String.format(Locale.ROOT,"接收 %d 列 · %.1f MiB · 缓冲 %.1f MiB · 请求 %d",s.applied,s.received/1048576.0,s.memory.get()/1048576.0,s.pending.size());}
+    public static String status(){if(maintenancePaused)return "服务端正在导入远景";Session s=session;return s==null?(failure.isEmpty()?"无服务端远景会话":failure):String.format(Locale.ROOT,"接收 %d 列 · %.1f MiB · 缓冲 %.1f MiB · 请求 %d%s",s.applied,s.received/1048576.0,s.memory.get()/1048576.0,s.pending.size(),s.budgetInsufficient.isEmpty()?"":" · 信用不足 "+s.budgetInsufficient.size()+" 列");}
     public static void close(){
         Session s=session;if(s==null)return;
         // Finish the current write before handing ingest back; queued work rechecks closed under this lock.
         synchronized(VoxyBridge.coverage(s.engine)){s.closed=true;session=null;}
         if(DebugLog.enabled())DebugLog.log("CLIENT close epoch={} applied={} payload_bytes={} pending={} worker_queue={}",s.epoch,s.applied,s.received,s.pending.size(),s.worker.getQueue().size());
-        synchronized(s.assemblies){for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();}
-        s.worker.execute(s.engine::releaseRef);s.worker.shutdown();retired.add(s);
+        synchronized(s.assemblies){for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();s.discardedBatches.clear();}
+        s.releaseOnTermination=true;s.worker.shutdown();retired.add(s);
     }
     public static void shutdown(){close();try{for(Session s:retired)while(!s.worker.awaitTermination(1,TimeUnit.SECONDS)){}retired.clear();}catch(InterruptedException e){Thread.currentThread().interrupt();throw new IllegalStateException(e);}}
     private RemoteClient(){}
