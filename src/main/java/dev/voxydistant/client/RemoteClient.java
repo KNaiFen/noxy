@@ -214,8 +214,8 @@ public final class RemoteClient {
         }
         var expired=expireRequests(s,System.nanoTime());
         for(int i=0;i<expired.size();i+=16)send(s,List.of(),expired.subList(i,Math.min(i+16,expired.size())));
-        s.scanBudget=256;
-        s.requestBudget=256;
+        s.scanBudget=DistantConfig.SCAN_COLUMNS_PER_TICK.get();
+        s.requestBudget=DistantConfig.REQUEST_COLUMNS_PER_TICK.get();
         requestMore(s);
     }
     public static void requestCacheStats() {
@@ -318,8 +318,10 @@ public final class RemoteClient {
                     try{
                         long started=System.nanoTime();
                         var candidates=new ArrayList<Long>();var index=VoxyBridge.coverage(s.engine);
+                        int scanLimit=DistantConfig.FAST_SCAN_COLUMNS_PER_BATCH.get();
+                        int candidateLimit=DistantConfig.FAST_SCAN_CANDIDATES_PER_BATCH.get();
                         int scanned=0;boolean done=false;
-                        while(scanned++<8192&&candidates.size()<64){
+                        while(scanned++<scanLimit&&candidates.size()<candidateLimit){
                             var next=fastScan.next();
                             if(next==null){done=true;break;}
                             int x=cx+next.x(),z=cz+next.z();

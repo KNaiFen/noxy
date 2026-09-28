@@ -213,9 +213,10 @@ public final class GenerationController {
         }
 
         private void refill(int cap) {
-            // At most 4096 inexpensive coverage checks per tick, bounded queue.
+            // Bounded coverage checks per tick and a bounded candidate queue.
             int remaining = Math.max(0, cap - generating.size() - converting.size());
-            for (int checked = 0; checked < 4096 && candidates.size() < remaining && !exhausted; checked++) {
+            int scanLimit = DistantConfig.LOCAL_SCAN_COLUMNS_PER_TICK.get();
+            for (int checked = 0; checked < scanLimit && candidates.size() < remaining && !exhausted; checked++) {
                 var offset = scan.next();
                 if (offset == null) { exhausted = true; break; }
                 var pos = new ChunkPos(centerX + offset.x(), centerZ + offset.z());

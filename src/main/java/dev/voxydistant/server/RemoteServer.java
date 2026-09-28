@@ -283,11 +283,7 @@ public final class RemoteServer {
         s.bandwidth=r.bandwidth();s.advertisedCapacity=r.capacity();s.capacity=creditLimit(s);
         for(var cancel:r.cancels())cancel(s,cancel);
         if (s.requestTick!=ticks) { s.requestTick=ticks; s.requestsThisTick=0; }
-        if ((s.requestsThisTick+=r.wants().size())>256) {
-            s.blocked("request_rate");
-            for(var want:r.wants())reply(s,want,1,"request_rate");
-            return;
-        }
+        int requestLimit=DistantConfig.PLAYER_REQUESTS_PER_TICK.get();
         if(DebugLog.enabled()&&(newEpoch||DebugLog.verbose()))DebugLog.log("SERVER request player={} epoch={} radius={} view={} wants={} advertised_credit={} effective_credit={} bandwidth_kib={}",player.getUUID(),s.epoch,s.radius,s.view,r.wants().size(),r.capacity(),s.capacity,s.bandwidth);
         // A client may enable reception after vanilla chunks arrived, or rebuild its world on Hello.
         // Replay their revisions so it can ingest the already loaded chunks into the new LOD world.
@@ -296,6 +292,8 @@ public final class RemoteServer {
         for (var want:r.wants()) {
             ColumnCodec.bounded(want.level(),0,5);
             if(DebugLog.verbose())DebugLog.log("SERVER want player={} epoch={} x={} z={} request_id={} version={} level={}",player.getUUID(),s.epoch,want.x(),want.z(),want.requestId(),want.version(),want.level());
+            if(s.requestsThisTick>=requestLimit){s.blocked("request_rate");reply(s,want,1,"request_rate");continue;}
+            s.requestsThisTick++;
             long pos=ChunkPos.asLong(want.x(),want.z());
             // Client request IDs rise across the epoch; keep the watermark after a coordinate is released.
             if(want.requestId()!=0&&want.requestId()<=s.latestRequestId)continue;
@@ -355,7 +353,7 @@ public final class RemoteServer {
         for(var it=savedUnloads.iterator();it.hasNext();){Key k=it.next();if(server.getLevel(k.dimension).getChunkSource().getChunkNow(k.x,k.z)==null&&!work.containsKey(k)&&!dirty.containsKey(k)&&dirtyWrites.get()==0){versions.remove(k);it.remove();}}
         lastChangeTick.clear();
         // Light-engine storage removal also emits updates after a chunk has unloaded.
-        int lightBudget=256;for(var it=lightChanges.iterator();it.hasNext()&&lightBudget-->0;){Key k=it.next();it.remove();var level=server.getLevel(k.dimension);if(level.getChunkSource().getChunkNow(k.x,k.z)!=null)markDirty(level,k.x,k.z);}
+        int lightBudget=DistantConfig.LIGHT_CHANGES_PER_TICK.get();for(var it=lightChanges.iterator();it.hasNext()&&lightBudget-->0;){Key k=it.next();it.remove();var level=server.getLevel(k.dimension);if(level.getChunkSource().getChunkNow(k.x,k.z)!=null)markDirty(level,k.x,k.z);}
         PriorityState.tick(server);
         if(reopening)return;
         if(database==null || world==null) {
@@ -458,8 +456,9 @@ public final class RemoteServer {
         byte[] refreshAfter=refreshCursor, missingAfter=missingCursor;
         workers.execute(()->{
             try{
-                var refresh=database.pending(3,refreshAfter,128);
-                var missing=database.pending(4,missingAfter,128);
+                int batch=DistantConfig.BACKGROUND_SCAN_COLUMNS_PER_PASS.get();
+                var refresh=database.pending(3,refreshAfter,batch);
+                var missing=database.pending(4,missingAfter,batch);
                 complete(()->{
                     refreshCursor=refresh.exhausted()?null:refresh.last();
                     missingCursor=missing.exhausted()?null:missing.last();
@@ -871,7 +870,8 @@ public final class RemoteServer {
         // Ordered invalidations: an older asynchronous batch must never replace a newer revision.
         if(dirtyWrites.get()!=0)return;
         var batch=new HashMap<byte[],byte[]>();var flushed=new HashMap<Key,Long>();int count=0;
-        for(var it=dirty.entrySet().iterator();it.hasNext() && count++<256;) {
+        int dirtyLimit=DistantConfig.DIRTY_COLUMNS_PER_FLUSH.get();
+        for(var it=dirty.entrySet().iterator();it.hasNext() && count++<dirtyLimit;) {
             var e=it.next();it.remove();Key k=e.getKey();long version=e.getValue();
             batch.put(k.key(2),ByteBuffer.allocate(8).putLong(version).array());
             batch.put(k.key(3),LodDatabase.pendingValue(version,0));
@@ -879,7 +879,8 @@ public final class RemoteServer {
             if(!exclusiveImport()&&!importStorageFailed)for(Session s:players.values())if(s.dimension==k.dimension && inRange(s,k.x,k.z))Protocol.send(s.player,new Protocol.Dirty(k.dimension.location().toString(),k.x,k.z,version,false));
         }
         var checks=new ArrayList<Key>();count=0;
-        for(var it=missingChecks.iterator();it.hasNext()&&count++<256;){Key key=it.next();it.remove();checks.add(key);}
+        int missingLimit=DistantConfig.MISSING_CHECKS_PER_FLUSH.get();
+        for(var it=missingChecks.iterator();it.hasNext()&&count++<missingLimit;){Key key=it.next();it.remove();checks.add(key);}
         checks.removeIf(flushed::containsKey);
         dirtyWrites.incrementAndGet();workers.execute(() -> {try{
             database.invalidationsAndMissing(batch,checks.stream().map(k->k.key(4)).toList());

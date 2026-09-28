@@ -23,9 +23,9 @@ public final class Protocol {
         return total+raw*3L+scratch;
     }
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(new ResourceLocation("voxy_distant", "lod"),
-            () -> "14", Protocol::compatible, Protocol::compatible);
+            () -> "15", Protocol::compatible, Protocol::compatible);
     private static boolean compatible(String version) {
-        return version.equals("14") || version.equals(NetworkRegistry.ABSENT) || version.equals(NetworkRegistry.ACCEPTVANILLA);
+        return version.equals("15") || version.equals(NetworkRegistry.ABSENT) || version.equals(NetworkRegistry.ACCEPTVANILLA);
     }
     public record Hello(UUID world,String dimension, int radius, int minY, int maxY, List<String> bands) {}
     public record Maintenance(boolean paused) {}

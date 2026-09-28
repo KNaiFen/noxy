@@ -36,6 +36,11 @@ public final class ServerSettings {
             if (value == IMPORT_THREADS) return "0 自动：逻辑处理器数减 2，限制 1～32；显式 1～256，独占导入线程";
             if (value == IMPORT_MEMORY) return "0 自动：最大堆的 1/8，限制 64～1024 MiB；显式 64～4096 MiB，仅 NBT/快照预算";
             if (value == PLAYER_KBPS) return "0 自动：不加每人固定上限；仍受全服上传及客户端下载上限约束";
+            if (value == PLAYER_REQUESTS_PER_TICK) return "每玩家每 tick 最多接收的列请求；调高会增加请求处理和后续缓存读取/生成负载，超额请求会重试";
+            if (value == LIGHT_CHANGES_PER_TICK) return "每 tick 最多处理的光照变化列；调高可更快标记远景缓存失效，但增加服务端主线程开销";
+            if (value == DIRTY_COLUMNS_PER_FLUSH) return "每次失效通知最多处理的脏列；调高可更快通知客户端，但增加服务端主线程和数据库写入负载";
+            if (value == MISSING_CHECKS_PER_FLUSH) return "每次最多检查的缺失列；调高可更快发现后台工作，但增加服务端主线程和数据库工作量";
+            if (value == BACKGROUND_SCAN_COLUMNS_PER_PASS) return "后台每次分别读取的刷新/缺失索引条目；调高可更快发现待处理列，但增加数据库 IO 和工作线程占用";
             if (value == RECOVERY_SECONDS) return "0 在健康观察期结束后立即恢复全速；其余值为线性恢复秒数";
             if (value == PLAYER_SEND_MIB || value == TOTAL_SEND_MIB) return "至少容纳一个整列缓存读取；原版主世界需 3 MiB，更高维度可能更多";
             if (value == BANDS) return "半径:层级，逗号分隔；最后一档延伸至接收边界";
@@ -56,12 +61,17 @@ public final class ServerSettings {
         new Field("传输", "Zstd 压缩等级", COMPRESSION_LEVEL),
         new Field("传输", "最大每批列数（1 逐列）", MAX_BATCH_COLUMNS),
         new Field("传输", "失效通知间隔（tick）", DIRTY_TICKS),
+        new Field("传输", "光照变化（列/tick）", LIGHT_CHANGES_PER_TICK),
+        new Field("传输", "脏列处理（列/次）", DIRTY_COLUMNS_PER_FLUSH),
+        new Field("传输", "缺失检查（列/次）", MISSING_CHECKS_PER_FLUSH),
+        new Field("传输", "每人请求（列/tick）", PLAYER_REQUESTS_PER_TICK),
         new Field("生成", "负载预设", SERVER_PRESET),
         new Field("生成", "每人并发", PLAYER_CONCURRENCY),
         new Field("生成", "每人待请求（列）", PLAYER_REQUEST_QUEUE),
         new Field("生成", "全服队列（列）", SERVER_QUEUE),
         new Field("生成", "后台刷新并发（列）", BACKGROUND_CONCURRENCY),
         new Field("生成", "后台刷新提交/秒", BACKGROUND_RATE),
+        new Field("生成", "后台索引扫描（条目/次）", BACKGROUND_SCAN_COLUMNS_PER_PASS),
         new Field("生成", "单列生成超时（秒）", GENERATION_TIMEOUT),
         new Field("生成", "自定义 · 转换线程", SERVER_THREADS),
         new Field("生成", "自定义 · 全服并发", SERVER_CONCURRENCY),

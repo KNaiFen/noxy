@@ -9,7 +9,7 @@ import java.nio.file.Files;
 import java.util.List;
 
 public final class DistantConfig {
-    public static final int CURRENT_CONFIG_VERSION = 3;
+    public static final int CURRENT_CONFIG_VERSION = 4;
     private static net.minecraftforge.fml.config.ModConfig registered;
     public enum Preset { MINIMAL, LOW, BALANCED, AGGRESSIVE, FULL, CUSTOM }
     public record Limits(int threads, int concurrency, int perSecond, double snapshotMillis, double dutyCycle) {}
@@ -20,12 +20,14 @@ public final class DistantConfig {
     public static final ForgeConfigSpec.IntValue CONFIG_VERSION;
     public static final ForgeConfigSpec.BooleanValue ENABLED;
     public static final ForgeConfigSpec.EnumValue<Preset> PRESET;
-    public static final ForgeConfigSpec.IntValue RADIUS, THREADS, CONCURRENCY, PER_SECOND, QUEUE, MEMORY;
+    public static final ForgeConfigSpec.IntValue RADIUS, THREADS, CONCURRENCY, PER_SECOND, QUEUE, MEMORY, LOCAL_SCAN_COLUMNS_PER_TICK;
     public static final ForgeConfigSpec.DoubleValue SNAPSHOT_MS, DUTY;
     public static final ForgeConfigSpec.BooleanValue RECEIVE, SERVER_ENABLED, SERVER_GENERATE, AUTO_THROTTLE;
-    public static final ForgeConfigSpec.IntValue RECEIVE_RADIUS, DOWNLOAD_KBPS, RECEIVE_MIB, INDEX_MIB, REQUEST_WINDOW;
+    public static final ForgeConfigSpec.IntValue RECEIVE_RADIUS, DOWNLOAD_KBPS, RECEIVE_MIB, INDEX_MIB, REQUEST_WINDOW,
+            SCAN_COLUMNS_PER_TICK, FAST_SCAN_COLUMNS_PER_BATCH, FAST_SCAN_CANDIDATES_PER_BATCH, REQUEST_COLUMNS_PER_TICK;
     public static final ForgeConfigSpec.IntValue SERVER_RADIUS, PLAYER_CONCURRENCY, SERVER_QUEUE, SERVER_MEMORY,
-            PLAYER_SEND_MIB, TOTAL_SEND_MIB, PLAYER_KBPS, DIRTY_TICKS, SERVER_THREADS, SERVER_CONCURRENCY, SERVER_RATE, SERVER_CACHE_MIB, COMPRESSION_LEVEL, MAX_BATCH_COLUMNS, PLAYER_REQUEST_QUEUE, BACKGROUND_CONCURRENCY, BACKGROUND_RATE;
+            PLAYER_SEND_MIB, TOTAL_SEND_MIB, PLAYER_KBPS, DIRTY_TICKS, SERVER_THREADS, SERVER_CONCURRENCY, SERVER_RATE, SERVER_CACHE_MIB, COMPRESSION_LEVEL, MAX_BATCH_COLUMNS, PLAYER_REQUEST_QUEUE, BACKGROUND_CONCURRENCY, BACKGROUND_RATE,
+            PLAYER_REQUESTS_PER_TICK, DIRTY_COLUMNS_PER_FLUSH, MISSING_CHECKS_PER_FLUSH, BACKGROUND_SCAN_COLUMNS_PER_PASS, LIGHT_CHANGES_PER_TICK;
     public static final ForgeConfigSpec.DoubleValue TOTAL_MBPS, SLOW_MS, PAUSE_MS, RESUME_MS, PAUSE_TPS, RESUME_TPS,
             RESUME_SECONDS, RECOVERY_SECONDS, SERVER_SNAPSHOT_MS, SERVER_DUTY, RECEIVE_DUTY;
     public static final ForgeConfigSpec.IntValue SLOW_TICKS, PAUSE_TICKS, GENERATION_TIMEOUT;
@@ -43,6 +45,10 @@ public final class DistantConfig {
         DOWNLOAD_KBPS = b.comment(ConfigLanguage.comment("DOWNLOAD_KBPS")).defineInRange("downloadKiBPerSecond", 0, 0, 131072);
         RECEIVE_MIB = b.comment(ConfigLanguage.comment("RECEIVE_MIB")).defineInRange("receiveMemoryMiB", 128, 4, 1024);
         REQUEST_WINDOW = b.comment(ConfigLanguage.comment("REQUEST_WINDOW")).defineInRange("requestWindowColumns", 256, 1, 1024);
+        SCAN_COLUMNS_PER_TICK = b.comment(ConfigLanguage.comment("SCAN_COLUMNS_PER_TICK")).defineInRange("scanColumnsPerTick", 256, 1, 8192);
+        FAST_SCAN_COLUMNS_PER_BATCH = b.comment(ConfigLanguage.comment("FAST_SCAN_COLUMNS_PER_BATCH")).defineInRange("fastScanColumnsPerBatch", 8192, 1, 65536);
+        FAST_SCAN_CANDIDATES_PER_BATCH = b.comment(ConfigLanguage.comment("FAST_SCAN_CANDIDATES_PER_BATCH")).defineInRange("fastScanCandidatesPerBatch", 64, 1, 256);
+        REQUEST_COLUMNS_PER_TICK = b.comment(ConfigLanguage.comment("REQUEST_COLUMNS_PER_TICK")).defineInRange("requestColumnsPerTick", 256, 1, 4096);
         INDEX_MIB = b.comment(ConfigLanguage.comment("INDEX_MIB")).defineInRange("indexMemoryMiB", 256, 16, 10240);
         RECEIVE_DUTY = b.comment(ConfigLanguage.comment("RECEIVE_DUTY")).defineInRange("processingDutyCycle", 1.0, 0.05, 1.0);
         b.push("localGeneration");
@@ -51,6 +57,7 @@ public final class DistantConfig {
         PRESET = b.comment(ConfigLanguage.comment("PRESET")).defineEnum("preset", Preset.BALANCED);
         QUEUE = b.comment(ConfigLanguage.comment("QUEUE")).defineInRange("queueColumns", 256, 1, 4096);
         MEMORY = b.comment(ConfigLanguage.comment("MEMORY")).defineInRange("snapshotMemoryMiB", 128, 1, 4096);
+        LOCAL_SCAN_COLUMNS_PER_TICK = b.comment(ConfigLanguage.comment("LOCAL_SCAN_COLUMNS_PER_TICK")).defineInRange("scanColumnsPerTick", 4096, 1, 65536);
         b.push("custom");
         THREADS = b.comment(ConfigLanguage.comment("THREADS")).defineInRange("conversionThreads", 2, 1, 256);
         CONCURRENCY = b.comment(ConfigLanguage.comment("CONCURRENCY")).defineInRange("generationConcurrency", 4, 1, 64);
@@ -71,6 +78,10 @@ public final class DistantConfig {
         PLAYER_SEND_MIB = b.comment(ConfigLanguage.comment("PLAYER_SEND_MIB")).defineInRange("playerSendMemoryMiB", 32, 1, 1024);
         TOTAL_SEND_MIB = b.comment(ConfigLanguage.comment("TOTAL_SEND_MIB")).defineInRange("totalSendMemoryMiB", 64, 4, 4096);
         DIRTY_TICKS = b.comment(ConfigLanguage.comment("DIRTY_TICKS")).defineInRange("dirtyIntervalTicks", 10, 1, 1200);
+        LIGHT_CHANGES_PER_TICK = b.comment(ConfigLanguage.comment("LIGHT_CHANGES_PER_TICK")).defineInRange("lightChangesPerTick", 256, 1, 4096);
+        DIRTY_COLUMNS_PER_FLUSH = b.comment(ConfigLanguage.comment("DIRTY_COLUMNS_PER_FLUSH")).defineInRange("dirtyColumnsPerFlush", 256, 1, 4096);
+        MISSING_CHECKS_PER_FLUSH = b.comment(ConfigLanguage.comment("MISSING_CHECKS_PER_FLUSH")).defineInRange("missingChecksPerFlush", 256, 1, 4096);
+        PLAYER_REQUESTS_PER_TICK = b.comment(ConfigLanguage.comment("PLAYER_REQUESTS_PER_TICK")).defineInRange("playerRequestsPerTick", 256, 1, 4096);
         SERVER_CACHE_MIB = b.comment(ConfigLanguage.comment("SERVER_CACHE_MIB")).defineInRange("cacheMemoryMiB", 128, 8, 1024);
         b.push("generation");
         SERVER_PRESET = b.comment(ConfigLanguage.comment("SERVER_PRESET")).defineEnum("preset", Preset.CUSTOM);
@@ -79,6 +90,7 @@ public final class DistantConfig {
         SERVER_QUEUE = b.comment(ConfigLanguage.comment("SERVER_QUEUE")).defineInRange("queueColumns", 2048, 1, 4096);
         BACKGROUND_CONCURRENCY = b.comment(ConfigLanguage.comment("BACKGROUND_CONCURRENCY")).defineInRange("backgroundConcurrency", 8, 1, 64);
         BACKGROUND_RATE = b.comment(ConfigLanguage.comment("BACKGROUND_RATE")).defineInRange("backgroundSubmissionsPerSecond", 128, 1, 10000);
+        BACKGROUND_SCAN_COLUMNS_PER_PASS = b.comment(ConfigLanguage.comment("BACKGROUND_SCAN_COLUMNS_PER_PASS")).defineInRange("backgroundScanColumnsPerPass", 128, 1, 4096);
         SERVER_MEMORY = b.comment(ConfigLanguage.comment("SERVER_MEMORY")).defineInRange("snapshotMemoryMiB", 128, 4, 4096);
         GENERATION_TIMEOUT = b.comment(ConfigLanguage.comment("GENERATION_TIMEOUT")).defineInRange("columnTimeoutSeconds", 60, 5, 600);
         AUTO_THROTTLE = b.comment(ConfigLanguage.comment("AUTO_THROTTLE")).define("automaticThrottle", true);
