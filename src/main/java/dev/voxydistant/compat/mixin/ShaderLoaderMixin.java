@@ -14,19 +14,23 @@ public class ShaderLoaderMixin {
             String source=cir.getReturnValue();
             String declaration="layout(location = 0) out flat uvec4 interData;";
             String anchor="uvec2 pos = positionBuffer[gl_BaseInstance];";
-            if(!source.contains(declaration)||!source.contains(anchor))throw new IllegalStateException("Unsupported Voxy quad vertex shader");
-            cir.setReturnValue(source.replace(declaration,declaration+"\nlayout(location = 2) out flat uint distantLevel;")
-                    .replace(anchor,anchor+"\ndistantLevel = getLoDLevel(pos);"));
+            String position="gl_Position =";
+            if(!source.contains(declaration)||!source.contains(anchor)||!source.contains(position))throw new IllegalStateException("Unsupported Voxy quad vertex shader");
+            cir.setReturnValue(source.replace(declaration,declaration+"\nlayout(location = 2) out flat uint distantLevel;\nlayout(location = 3) out vec2 distantXZ;")
+                    .replace(anchor,anchor+"\ndistantLevel = getLoDLevel(pos);")
+                    .replace(position, "distantXZ = quad.basePoint.xz + swizzelDataAxis(quad.axis, vec3(quad.quadSizeAddin * vec2((gl_VertexID >> 1) & 1, gl_VertexID & 1) * quad.lodScale, 0)).xz - cameraSubPos.xz;\n    gl_Position ="));
             return;
         }
         if(id.equals("voxy:lod/gl46/quads.frag")){
             String source=cir.getReturnValue();
             String declaration="layout(location = 0) in flat uvec4 interData;";
             String anchor="if (DEPTH_SCALAR_COMPARE(gl_FragCoord.z, texelFetch(depthTex, ivec2(gl_FragCoord.xy), 0).r)) {";
-            if(!source.contains(declaration)||!source.contains(anchor))throw new IllegalStateException("Unsupported Voxy quad fragment shader");
-            // Vanilla pixels are already protected by stencil. Its section volume does not
-            // match coarse surfaces and cuts sky holes at the seam; retain that mask for L0.
-            cir.setReturnValue(source.replace(declaration,declaration+"\nlayout(location = 2) in flat uint distantLevel;")
+            String clip="if (any(notEqual(clamp(tile,";
+            if(!source.contains(declaration)||!source.contains(anchor)||!source.contains(clip))throw new IllegalStateException("Unsupported Voxy quad fragment shader");
+            // Parent meshes can extend beyond the requested circle even when their node bounds touch it.
+            // Clip actual fragments so a temporary coarse parent and its finer children agree at the edge.
+            cir.setReturnValue(source.replace(declaration,declaration+"\nlayout(location = 2) in flat uint distantLevel;\nlayout(location = 3) in vec2 distantXZ;\nuniform float distantRadiusSquared;")
+                    .replace(clip, "if (distantRadiusSquared >= 0.0 && dot(distantXZ, distantXZ) > distantRadiusSquared) discard;\n    if (any(notEqual(clamp(tile,")
                     .replace(anchor,"if (distantLevel == 0u && DEPTH_SCALAR_COMPARE(gl_FragCoord.z, texelFetch(depthTex, ivec2(gl_FragCoord.xy), 0).r)) {"));
             return;
         }

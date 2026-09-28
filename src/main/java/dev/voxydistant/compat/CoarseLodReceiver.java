@@ -64,9 +64,9 @@ public final class CoarseLodReceiver {
         var registry=registries.registryOrThrow(Registries.BIOME);
         for(int i=0;i<biomes.length;i++)biomes[i]=mapper.getIdForBiome(registry.getHolderOrThrow(net.minecraft.resources.ResourceKey.create(Registries.BIOME,new ResourceLocation(column.biomes().get(i)))));
         var coverage=VoxyBridge.coverage(world);
-        DebugLog.end(CLIENT_MAP,mapping);long lock=DebugLog.start();
+        DebugLog.end(CLIENT_MAP,mapping);
         synchronized(coverage) {
-            DebugLog.end(CLIENT_COVERAGE_LOCK,lock);long voxels=DebugLog.start();
+            long voxels=DebugLog.start();
             coverage.restrict(column.x(),column.z(),column.minY(),column.minY()+column.sections().length,column.version(),authoritative);
             coverage.meshBegin(column.x(),column.z(),column.minY(),column.minY()+column.sections().length);
             try {
