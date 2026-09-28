@@ -97,6 +97,7 @@ public final class RemoteClient {
         final Map<Long,Long> deferredDirty=new LinkedHashMap<>();
         final ArrayDeque<Protocol.Reply> deferredReplies=new ArrayDeque<>();
         final Set<Long> deferredSnapshots=ConcurrentHashMap.newKeySet();
+        final ConcurrentHashMap<Long,ChunkSnapshot> latestSnapshots=new ConcurrentHashMap<>();
         boolean checkpointPending;
         boolean activePending;int activeX,activeZ,activeRadius;
         final DistanceBands bands;volatile int epoch=++sequence;volatile boolean closed;
@@ -386,7 +387,9 @@ public final class RemoteClient {
                     long latest=s.versions.getOrDefault(ChunkPos.asLong(f.x(),f.z()),0L);
                     long position=ChunkPos.asLong(f.x(),f.z());
                     var coverage=VoxyBridge.coverage(s.engine);
+                    long lock=DebugLog.start();
                     synchronized(coverage){
+                        DebugLog.end(CLIENT_COVERAGE_LOCK,lock);
                         if(session==s&&s.epoch==f.epoch()&&currentRequest(s,position,f.requestId())&&!s.loadedFull.contains(position)&&column.version()>=latest){long apply=DebugLog.start();int conflicts=coverage.conflicts(column.x(),column.z(),s.hello.minY(),s.hello.maxY(),column.version());if(conflicts>0){DebugLog.count(CLIENT_OLD_VERSION_REPLACED);if(DebugLog.verbose())DebugLog.log("CLIENT authoritative_replace x={} z={} reply_version={} newer_sections={}",column.x(),column.z(),column.version(),conflicts);}CoarseLodReceiver.receive(s.engine,column,s.level.registryAccess(),true);complete.trace.apply+=DebugLog.end(CLIENT_APPLY,apply);s.applied++;complete.trace.applied++;}
                     }
                     result="ok";
@@ -475,7 +478,9 @@ public final class RemoteClient {
                         long p=ChunkPos.asLong(m.x(),m.z());
                         long latest=s.versions.getOrDefault(p,0L);
                         var coverage=VoxyBridge.coverage(s.engine);
+                        long lock=DebugLog.start();
                         synchronized(coverage){
+                            DebugLog.end(CLIENT_COVERAGE_LOCK,lock);
                             if(session==s&&s.epoch==f.epoch()&&currentRequest(s,p,m.requestId())&&!s.loadedFull.contains(p)&&column.version()>=latest){long apply=DebugLog.start();int conflicts=coverage.conflicts(column.x(),column.z(),s.hello.minY(),s.hello.maxY(),column.version());if(conflicts>0){DebugLog.count(CLIENT_OLD_VERSION_REPLACED);if(DebugLog.verbose())DebugLog.log("CLIENT authoritative_replace x={} z={} reply_version={} newer_sections={}",column.x(),column.z(),column.version(),conflicts);}CoarseLodReceiver.receive(s.engine,column,s.level.registryAccess(),true,batch);complete.trace.apply+=DebugLog.end(CLIENT_APPLY,apply);s.applied++;complete.trace.applied++;}
                         }
                         if(DebugLog.verbose())DebugLog.log("CLIENT column epoch={} transfer={} x={} z={} request_id={} level={} version={} latest={} raw_bytes={} applied={}",f.epoch(),f.transfer(),m.x(),m.z(),m.requestId(),m.level(),m.version(),latest,m.rawLength(),currentRequest(s,p,m.requestId())&&column.version()>=latest);
@@ -492,6 +497,7 @@ public final class RemoteClient {
         if(greeting==null||!greeting.dimension().equals(d.dimension()))return;
         Session s=session;long pos=ChunkPos.asLong(d.x(),d.z());if(s==null){initialVersions.merge(pos,d.version(),Math::max);return;}
         long previous=s.versions.getOrDefault(pos,0L);s.versions.merge(pos,d.version(),Math::max);s.checked.remove(pos);s.retries.remove(pos);if(d.version()>previous)s.budgetInsufficient.remove(pos);if(!d.vanilla())s.invalid.add(pos);
+        invalidateSnapshots(s,d.x(),d.z());
         // A revision applies to the whole column, even when vanilla changed only one section.
         // Recapture loaded columns after the following vanilla packet has run on the main thread.
         s.fullRetry.add(pos);
@@ -513,20 +519,23 @@ public final class RemoteClient {
         if(s.checkpointPending&&s.offer(()->{long timing=DebugLog.start();try{VoxyBridge.coverage(s.engine).checkpointIfDue(s.engine.storage::flush);}catch(RuntimeException e){failed(s,e);}finally{DebugLog.end(CLIENT_CHECKPOINT,timing);}}))s.checkpointPending=false;
     }
     public static boolean handles(WorldEngine world){Session s=session;return s!=null&&!s.closed&&s.engine==world;}
+    public static float renderRadiusSquared(){Session s=session;if(s==null||s.closed||s.radius==0)return -1;float blocks=s.radius*16f;return blocks*blocks;}
     public static void lightPending(net.minecraft.client.multiplayer.ClientLevel level,int x,int z){
         if(lightLevel!=level){lightLevel=level;lightReady.clear();}
         lightReady.remove(ChunkPos.asLong(x,z));
+        Session s=session;if(s!=null&&s.level==level)invalidateSnapshots(s,x,z);
     }
     public static void lightApplied(net.minecraft.client.multiplayer.ClientLevel level,int x,int z){
         if(lightLevel!=level){lightLevel=level;lightReady.clear();}
         if(level.getChunkSource().getChunk(x,z,ChunkStatus.FULL,false)==null)return;
         long p=ChunkPos.asLong(x,z);lightReady.add(p);
-        Session s=session;if(s!=null&&s.level==level&&!s.closed)s.fullRetry.add(p);
+        Session s=session;if(s!=null&&s.level==level&&!s.closed){invalidateSnapshots(s,x,z);s.fullRetry.add(p);}
     }
     public static void unload(LevelChunk chunk){
         long p=chunk.getPos().toLong();lightReady.remove(p);
         Session s=session;if(s==null||s.closed||chunk.getLevel()!=s.level)return;
         s.loadedFull.remove(p);s.checked.remove(p);s.retries.remove(p);s.fullRetry.remove(p);
+        invalidateSnapshots(s,chunk.getPos().x,chunk.getPos().z);
         if(inRange(s,chunk.getPos().x,chunk.getPos().z))s.invalid.add(p);
     }
     public static boolean full(WorldEngine world,LevelChunk chunk) {
@@ -543,18 +552,25 @@ public final class RemoteClient {
         if(maintenancePaused)return;
         Session s=session;if(s==null||s.engine!=world||s.closed)return;
         long p=ChunkPos.asLong(x,z);
-        if(lightLevel!=s.level||!lightReady.contains(p)){s.fullRetry.add(p);return;}
+        long key=SectionPos.asLong(x,y,z);
+        if(lightLevel!=s.level||!lightReady.contains(p)){s.latestSnapshots.remove(key);s.fullRetry.add(p);return;}
         long version=s.versions.getOrDefault(p,0L);if(version==0)return;
-        if(s.worker.getQueue().size()>=256){s.deferredSnapshots.add(p);return;}
-        long bytes=ChunkSnapshot.RESERVED_BYTES;if(s.snapshotMemory.addAndGet(bytes)>s.snapshotLimit){s.snapshotMemory.addAndGet(-bytes);Minecraft.getInstance().execute(()->{if(session==s)s.fullRetry.add(ChunkPos.asLong(x,z));});return;}s.memory.addAndGet(bytes);
+        if(s.worker.getQueue().size()>=256){s.latestSnapshots.remove(key);s.deferredSnapshots.add(p);return;}
+        long bytes=ChunkSnapshot.RESERVED_BYTES;if(s.snapshotMemory.addAndGet(bytes)>s.snapshotLimit){s.snapshotMemory.addAndGet(-bytes);s.latestSnapshots.remove(key);Minecraft.getInstance().execute(()->{if(session==s)s.fullRetry.add(ChunkPos.asLong(x,z));});return;}s.memory.addAndGet(bytes);
         var biomes=section.getBiomes().recreate();for(int by=0;by<4;by++)for(int bz=0;bz<4;bz++)for(int bx=0;bx<4;bx++)biomes.getAndSetUnchecked(bx,by,bz,section.getBiomes().get(bx,by,bz));
         var snapshot=new ChunkSnapshot(x,y,z,section.getStates().copy(),biomes,block==null?null:block.copy(),sky==null?null:sky.copy());int epoch=s.epoch;
+        // Retire only a queued predecessor after the new immutable capture exists.
+        DebugLog.count(CLIENT_SNAPSHOT_CAPTURE);s.latestSnapshots.put(key,snapshot);
         if(!s.offer(()->{
-            long started=System.nanoTime();try{synchronized(VoxyBridge.coverage(world)){if(!s.closed&&s.epoch==epoch&&version>=s.versions.getOrDefault(ChunkPos.asLong(x,z),0L))VoxyBridge.ingestRemote(world,snapshot,version);}}
-            catch(RuntimeException e){failed(s,e);}finally{pace(started);s.memory.addAndGet(-bytes);s.snapshotMemory.addAndGet(-bytes);}
+            long started=System.nanoTime();try{synchronized(VoxyBridge.coverage(world)){if(!s.closed&&s.epoch==epoch&&version>=s.versions.getOrDefault(ChunkPos.asLong(x,z),0L)){if(s.latestSnapshots.get(key)==snapshot)VoxyBridge.ingestRemote(world,snapshot,version);else DebugLog.count(CLIENT_SNAPSHOT_SUPERSEDED);}}}
+            catch(RuntimeException e){failed(s,e);}finally{s.latestSnapshots.remove(key,snapshot);pace(started);s.memory.addAndGet(-bytes);s.snapshotMemory.addAndGet(-bytes);}
         })){
+            s.latestSnapshots.remove(key,snapshot);
             s.memory.addAndGet(-bytes);s.snapshotMemory.addAndGet(-bytes);s.deferredSnapshots.add(p);
         }
+    }
+    private static void invalidateSnapshots(Session s,int x,int z){
+        for(int y=s.level.getMinSection();y<s.level.getMaxSection();y++)s.latestSnapshots.remove(SectionPos.asLong(x,y,z));
     }
     private static void pace(long started){double duty=DistantConfig.RECEIVE_DUTY.get();if(duty<1){long timing=DebugLog.start();java.util.concurrent.locks.LockSupport.parkNanos((long)((System.nanoTime()-started)*(1/duty-1)));DebugLog.end(CLIENT_PACE,timing);}}
     private static void failed(Session s,RuntimeException e){failure=e.toString();LOG.error("Voxy Distant receive failed",e);Minecraft.getInstance().execute(()->{if(session==s){s.radius=0;send(s,List.of());close();greeting=null;}});}

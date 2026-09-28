@@ -72,10 +72,8 @@ public final class VoxyBridge {
             try {
             ingest(world,snapshot,Long.MAX_VALUE);
             state.received(snapshot.x(),snapshot.y(),snapshot.z(),version,0,false);
-            for(int l=1;l<=4;l++){
-                var parent=world.acquire(l,snapshot.x()>>(l+1),snapshot.y()>>(l+1),snapshot.z()>>(l+1));
-                try{world.markDirty(parent,WorldEngine.DEFAULT_UPDATE_FLAGS,63);}finally{parent.release();}
-            }
+            // afterFull queued these parent updates; the outer meshEnd publishes them
+            // after received() has updated the coverage and child split state.
             }finally{state.meshEnd(world,snapshot.x(),snapshot.z(),snapshot.y(),snapshot.y()+1);}
         }
     }
@@ -122,16 +120,13 @@ public final class VoxyBridge {
         // unchanged empty L0, but must still erase the old coarse terrain above it.
         for (int level = 1; level <= 4; level++) {
             var upper = world.acquire(level, converted.x >> (level + 1), converted.y >> (level + 1), converted.z >> (level + 1));
+            // The source section changes only one octant of this 32-block parent.
+            int child=WorldSection.getChildIndex((converted.x>>level)&1,(converted.y>>level)&1,(converted.z>>level)&1);
             try {
                 dev.voxydistant.compat.mixin.UpdaterAccessor.distant$insertLevel(converted, upper);
+                occupancy(upper,1<<child);
                 world.markDirty(upper, WorldEngine.DEFAULT_UPDATE_FLAGS, 63);
             } finally { upper.release(); }
-        }
-        for(int l=1;l<=4;l++){
-            var parent=world.acquire(l,converted.x>>(l+1),converted.y>>(l+1),converted.z>>(l+1));
-            // The source section changes only one octant of this 32-block parent.
-            int child=WorldSection.getChildIndex((converted.x>>l)&1,(converted.y>>l)&1,(converted.z>>l)&1);
-            try{occupancy(parent,1<<child);world.markDirty(parent,WorldEngine.DEFAULT_UPDATE_FLAGS,63);}finally{parent.release();}
         }
         }
         for(int l=0;l<=4;l++){
