@@ -50,7 +50,7 @@ public final class RemoteClient {
             for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();
             s.discardedBatches.clear();
         }
-        s.x=Integer.MIN_VALUE;s.scan=null;s.scanHeld=null;
+        s.x=Integer.MIN_VALUE;s.scan=null;s.fastScan=null;s.fastCandidates.clear();s.fastScanning=false;s.fastStarted=false;s.fastDone=false;s.fastDuration=0;s.fastChecks=0;s.fastFirstAt=0;s.scanHeld=null;
         if(!maintenancePaused)s.fullRetry.addAll(s.versions.keySet());
     }
     private static final Map<Long,Long> initialVersions=new HashMap<>();
@@ -110,7 +110,7 @@ public final class RemoteClient {
         boolean checkpointPending;
         boolean activePending;int activeX,activeZ,activeRadius;
         final DistanceBands bands;volatile int epoch=++sequence;volatile boolean closed;
-        NearbyChunks scan;Long scanHeld;int x=Integer.MIN_VALUE,z,radius,requestedRadius,view,ticks,generation,scanBudget,scanRadius,requestBudget,preempted,indexMiB=DistantConfig.INDEX_MIB.get(),lastPressureTick=-200;volatile long applied,received;long requestSequence;
+        NearbyChunks scan,fastScan;final ArrayDeque<Long> fastCandidates=new ArrayDeque<>();boolean fastScanning,fastStarted,fastDone;long fastDuration,fastChecks,fastFirstAt;Long scanHeld;int x=Integer.MIN_VALUE,z,radius,requestedRadius,view,ticks,generation,scanBudget,scanRadius,requestBudget,preempted,indexMiB=DistantConfig.INDEX_MIB.get(),lastPressureTick=-200;volatile long applied,received;long requestSequence;
         boolean refillQueued;
         long debugAt,requestIdleAt;String requestState="initializing";
         long rateAt,rateBytes,rateColumns;double receiveKiBPerSecond,receiveColumnsPerSecond;
@@ -202,7 +202,7 @@ public final class RemoteClient {
         if(s.x!=x||s.z!=z||s.radius!=radius||s.view!=view) {
             if(DebugLog.enabled())DebugLog.log("CLIENT move epoch={} from_x={} from_z={} x={} z={} generation={} radius={} view={}",s.epoch,s.x,s.z,x,z,s.generation+1,radius,view);
             boolean teleport=s.x!=Integer.MIN_VALUE&&(Math.abs((long)x-s.x)>32||Math.abs((long)z-s.z)>32);
-            s.x=x;s.z=z;s.radius=radius;s.view=view;s.generation++;s.scan=new NearbyChunks(radius,-1);s.scanHeld=null;s.scanRadius=0;s.preempted=0;
+            s.x=x;s.z=z;s.radius=radius;s.view=view;s.generation++;s.scan=new NearbyChunks(radius,-1);s.fastScan=new NearbyChunks(radius,-1);s.fastCandidates.clear();s.fastScanning=false;s.fastStarted=false;s.fastDone=false;s.fastDuration=0;s.fastChecks=0;s.fastFirstAt=System.nanoTime();s.scanHeld=null;s.scanRadius=0;s.preempted=0;
             if(teleport){s.epoch=++sequence;s.pending.clear();s.checked.clear();s.invalid.clear();s.retries.clear();synchronized(s.assemblies){for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();s.discardedBatches.clear();}}
             s.checked.keySet().removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
             s.versions.keySet().removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
@@ -298,7 +298,50 @@ public final class RemoteClient {
             if(!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p))){s.retries.remove(p);continue;}
             if(!s.pending.containsKey(p))positions.add(p);
         }
-        while(s.scan!=null&&positions.size()<batch&&s.scanBudget>0) {
+        if(!s.fastDone||!s.fastCandidates.isEmpty()){
+            while(!s.fastCandidates.isEmpty()&&positions.size()<batch){
+                long p=s.fastCandidates.removeFirst();
+                if(s.pending.containsKey(p)||s.retries.scheduled(p)||s.checked.getOrDefault(p,5)<=desired(s,p))continue;
+                if(mc.level.getChunkSource().getChunk(ChunkPos.getX(p),ChunkPos.getZ(p),ChunkStatus.FULL,false)!=null){s.loadedFull.add(p);continue;}
+                if(s.pending.size()+positions.size()>=window){
+                    var cancel=preempt(s,p,positions);
+                    if(cancel==null){s.fastCandidates.addFirst(p);break;}
+                    cancels.add(cancel);
+                }
+                positions.add(p);
+            }
+            // Do not scan far ahead of the requests still awaiting the server.
+            if(s.fastCandidates.isEmpty()&&!s.fastScanning&&s.fastScan!=null&&s.pending.size()<Math.max(1,window-64)){
+                s.fastScanning=true;
+                int generation=s.generation,cx=s.x,cz=s.z;var fastScan=s.fastScan;
+                if(!s.offer(()->{
+                    try{
+                        long started=System.nanoTime();
+                        var candidates=new ArrayList<Long>();var index=VoxyBridge.coverage(s.engine);
+                        int scanned=0;boolean done=false;
+                        while(scanned++<8192&&candidates.size()<64){
+                            var next=fastScan.next();
+                            if(next==null){done=true;break;}
+                            int x=cx+next.x(),z=cz+next.z();
+                            if(index.column(x,z,s.hello.minY(),s.hello.maxY()).level()>s.bands.select(x,z,cx,cz))candidates.add(ChunkPos.asLong(x,z));
+                        }
+                        boolean complete=done;
+                        int count=scanned;long elapsed=System.nanoTime()-started;
+                        Minecraft.getInstance().execute(()->{
+                            if(session!=s||s.generation!=generation)return;
+                            s.fastScanning=false;s.fastCandidates.addAll(candidates);
+                            s.fastDuration+=elapsed;s.fastChecks+=count;
+                            if(!candidates.isEmpty()&&!s.fastStarted){s.fastStarted=true;if(DebugLog.enabled())DebugLog.log("CLIENT fast_scan_first epoch={} generation={} x={} z={} checks={} elapsed_ms={} lookup_ms={}",s.epoch,s.generation,ChunkPos.getX(candidates.getFirst()),ChunkPos.getZ(candidates.getFirst()),s.fastChecks,DebugLog.millis(System.nanoTime()-s.fastFirstAt),DebugLog.millis(s.fastDuration));}
+                            if(complete){s.fastScan=null;s.fastDone=true;if(DebugLog.enabled())DebugLog.log("CLIENT fast_scan_complete epoch={} generation={} checks={} lookup_ms={} pending={}",s.epoch,s.generation,s.fastChecks,DebugLog.millis(s.fastDuration),s.pending.size());}
+                            refill(s);
+                        });
+                    }catch(RuntimeException e){failed(s,e);}
+                }))s.fastScanning=false;
+            }
+        }
+        // Verify nearby cached revisions alongside the gap pass, but leave room for missing columns.
+        int verifyLimit=s.fastDone&&s.fastCandidates.isEmpty()?batch:s.fastStarted?Math.min(batch,positions.size()+Math.min(16,Math.max(0,window-64-s.pending.size()-positions.size()))):positions.size();
+        while(s.scan!=null&&positions.size()<verifyLimit&&s.scanBudget>0) {
             s.scanBudget--;
             Long held=s.scanHeld;s.scanHeld=null;
             var next=held==null?s.scan.next():null;if(held==null&&next==null){s.scan=null;s.scanRadius=s.radius;if(DebugLog.enabled())DebugLog.log("CLIENT scan_complete epoch={} generation={} pending={} refine={} retries={}",s.epoch,s.generation,s.pending.size(),s.invalid.size(),s.retries.size());break;}
@@ -316,7 +359,7 @@ public final class RemoteClient {
             positions.add(pos);
         }
         positions.removeIf(p->{if(mc.level.getChunkSource().getChunk(ChunkPos.getX(p),ChunkPos.getZ(p),ChunkStatus.FULL,false)==null)return false;s.loadedFull.add(p);s.fullRetry.add(p);s.retries.remove(p);return true;});
-        if(positions.isEmpty()){if(!cancels.isEmpty())send(s,List.of(),cancels);s.requestState=s.scan==null?"scan_complete":s.scanHeld!=null?"request_window":"scan_budget";return;}
+        if(positions.isEmpty()){if(!cancels.isEmpty())send(s,List.of(),cancels);s.requestState=s.scan==null?"scan_complete":s.scanHeld!=null?"request_window":!s.fastDone||!s.fastCandidates.isEmpty()?"fast_scan":"scan_budget";return;}
         s.requestBudget-=positions.size();
         DebugLog.end(CLIENT_REQUEST_IDLE,s.requestIdleAt);s.requestIdleAt=0;
         s.requestState="index_lookup";
