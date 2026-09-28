@@ -90,21 +90,17 @@ sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
 tasks.named('jar') {
     manifest.attributes('MixinConfigs': 'voxy_distant.mixins.json')
 }
-// Keep one distributable for Windows x64, Linux x64/ARM64, and macOS ARM64.
+// Keep one distributable for Windows x64 and Linux x64 (glibc/musl).
 // Trim only JarJar's staging copies; the resolved development dependencies stay intact.
 tasks.named('jarJar') {
     def nativeFiles = [
         'rocksdbjni-10.2.1.jar': [
             'librocksdbjni-win64.dll',
-            'librocksdbjni-linux64.so', 'librocksdbjni-linux64-musl.so',
-            'librocksdbjni-linux-aarch64.so', 'librocksdbjni-linux-aarch64-musl.so',
-            'librocksdbjni-osx-arm64.jnilib'
+            'librocksdbjni-linux64.so', 'librocksdbjni-linux64-musl.so'
         ],
         'zstd-jni-1.5.7-6.jar': [
             'win/amd64/libzstd-jni-1.5.7-6.dll',
-            'linux/amd64/libzstd-jni-1.5.7-6.so',
-            'linux/aarch64/libzstd-jni-1.5.7-6.so',
-            'darwin/aarch64/libzstd-jni-1.5.7-6.dylib'
+            'linux/amd64/libzstd-jni-1.5.7-6.so'
         ]
     ]
     inputs.property('nativeFiles', nativeFiles)
