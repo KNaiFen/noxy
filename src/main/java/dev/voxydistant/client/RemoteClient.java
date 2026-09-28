@@ -110,7 +110,7 @@ public final class RemoteClient {
         boolean checkpointPending;
         boolean activePending;int activeX,activeZ,activeRadius;
         final DistanceBands bands;volatile int epoch=++sequence;volatile boolean closed;
-        NearbyChunks scan;Long scanHeld;int x=Integer.MIN_VALUE,z,radius,requestedRadius,view,ticks,generation,scanBudget,requestBudget,preempted,indexMiB=DistantConfig.INDEX_MIB.get(),lastPressureTick=-200;volatile long applied,received;long requestSequence;
+        NearbyChunks scan;Long scanHeld;int x=Integer.MIN_VALUE,z,radius,requestedRadius,view,ticks,generation,scanBudget,scanRadius,requestBudget,preempted,indexMiB=DistantConfig.INDEX_MIB.get(),lastPressureTick=-200;volatile long applied,received;long requestSequence;
         boolean refillQueued;
         long debugAt,requestIdleAt;String requestState="initializing";
         long rateAt,rateBytes,rateColumns;double receiveKiBPerSecond,receiveColumnsPerSecond;
@@ -202,7 +202,7 @@ public final class RemoteClient {
         if(s.x!=x||s.z!=z||s.radius!=radius||s.view!=view) {
             if(DebugLog.enabled())DebugLog.log("CLIENT move epoch={} from_x={} from_z={} x={} z={} generation={} radius={} view={}",s.epoch,s.x,s.z,x,z,s.generation+1,radius,view);
             boolean teleport=s.x!=Integer.MIN_VALUE&&(Math.abs((long)x-s.x)>32||Math.abs((long)z-s.z)>32);
-            s.x=x;s.z=z;s.radius=radius;s.view=view;s.generation++;s.scan=new NearbyChunks(radius,-1);s.scanHeld=null;s.preempted=0;
+            s.x=x;s.z=z;s.radius=radius;s.view=view;s.generation++;s.scan=new NearbyChunks(radius,-1);s.scanHeld=null;s.scanRadius=0;s.preempted=0;
             if(teleport){s.epoch=++sequence;s.pending.clear();s.checked.clear();s.invalid.clear();s.retries.clear();synchronized(s.assemblies){for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();s.discardedBatches.clear();}}
             s.checked.keySet().removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
             s.versions.keySet().removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
@@ -236,7 +236,7 @@ public final class RemoteClient {
     }
     public static String receiveSpeed() {
         Session s=session;
-        return s==null?"接收速度：无会话":String.format(Locale.ROOT,"接收速度 %.1f KiB/s · %.1f 列/秒",s.receiveKiBPerSecond,s.receiveColumnsPerSecond);
+        return s==null?"接收速度：无会话":String.format(Locale.ROOT,"接收速度 %.1f KiB/s · %.1f 列/秒 · 扫描 %d/%d · 待确认 %d",s.receiveKiBPerSecond,s.receiveColumnsPerSecond,s.scanRadius,s.radius,s.pending.size());
     }
     public static String indexStatus(){
         Session s=session;
@@ -301,7 +301,8 @@ public final class RemoteClient {
         while(s.scan!=null&&positions.size()<batch&&s.scanBudget>0) {
             s.scanBudget--;
             Long held=s.scanHeld;s.scanHeld=null;
-            var next=held==null?s.scan.next():null;if(held==null&&next==null){s.scan=null;if(DebugLog.enabled())DebugLog.log("CLIENT scan_complete epoch={} generation={} pending={} refine={} retries={}",s.epoch,s.generation,s.pending.size(),s.invalid.size(),s.retries.size());break;}
+            var next=held==null?s.scan.next():null;if(held==null&&next==null){s.scan=null;s.scanRadius=s.radius;if(DebugLog.enabled())DebugLog.log("CLIENT scan_complete epoch={} generation={} pending={} refine={} retries={}",s.epoch,s.generation,s.pending.size(),s.invalid.size(),s.retries.size());break;}
+            if(next!=null&&next.distanceSquared()>(long)s.scanRadius*s.scanRadius)s.scanRadius=(int)Math.ceil(Math.sqrt(next.distanceSquared()));
             int cx=held==null?s.x+next.x():ChunkPos.getX(held),cz=held==null?s.z+next.z():ChunkPos.getZ(held);long pos=ChunkPos.asLong(cx,cz);int desired=s.bands.select(cx,cz,s.x,s.z);
             // Skip only columns the client actually has; its requested view may exceed the server view.
             if(mc.level.getChunkSource().getChunk(cx,cz,ChunkStatus.FULL,false)!=null){s.loadedFull.add(pos);continue;}
