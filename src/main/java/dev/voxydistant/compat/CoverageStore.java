@@ -20,6 +20,7 @@ public final class CoverageStore {
     private final LinkedHashMap<Long, Page> lru = new LinkedHashMap<>(16,.75f,true);
     private final Set<Long> unsafePages = new HashSet<>();
     private final Set<Long> changedPages = new HashSet<>();
+    private volatile boolean pressure;
     private final Map<Long,Set<Long>> pendingSaves = new HashMap<>();
     private long meshSequence;
     private long lastCheckpoint;
@@ -27,7 +28,9 @@ public final class CoverageStore {
     private final Map<me.cortex.voxy.common.world.WorldSection,Integer> deferredUpdates=new LinkedHashMap<>();
     private volatile long revision;
     private volatile boolean remote;
-    private int minY=-4,maxY=20,centerX,centerZ,radius,maxPages=192;
+    private int minY=-4,maxY=20,maxPages=192;
+    private volatile int centerX,centerZ,radius=-1;
+    public record Usage(int pages,int limit) {}
     private static final class Page {
         final byte[] minimum=new byte[32768];
         final long[] versions=new long[32768];
@@ -48,6 +51,39 @@ public final class CoverageStore {
     }
     public synchronized void remote(int min,int max,int memoryMiB){minY=min;maxY=max;maxPages=Math.max(8,(int)(memoryMiB*1048576L/350000));remote=true;}
     public synchronized void active(int x,int z,int r){centerX=x;centerZ=z;radius=r;}
+    public synchronized Usage usage(){return new Usage(lru.size(),maxPages);}
+    public boolean pressure(){return pressure;}
+    public synchronized boolean overBudget(){return lru.size()>maxPages;}
+    public synchronized int stepDown(int requested,int x,int z){
+        pressure=false;
+        return Math.min(limitRadius(requested,x,z),Math.max(0,radius-32));
+    }
+    /** Reserve a few pages for mesh work at the edge and writes awaiting a checkpoint. */
+    public synchronized int limitRadius(int requested,int x,int z){
+        int vertical=Math.floorDiv(maxY-1,32)-Math.floorDiv(minY,32)+1;
+        int available=Math.max(1,maxPages-Math.max(16,maxPages/20));
+        int low=0,high=requested;
+        while(low<high){int mid=low+(high-low+1)/2;if(pageCount(mid,x,z,vertical)+pinnedOutside(mid,x,z)<=available)low=mid;else high=mid-1;}
+        return low;
+    }
+    private int pinnedOutside(int radius,int x,int z){
+        int count=0;long squared=(long)radius*radius;
+        for(long id:changedPages){
+            long px=(long)nx(id)*32,pz=(long)nz(id)*32;
+            long dx=Math.max(Math.max(px-x,x-(px+31)),0),dz=Math.max(Math.max(pz-z,z-(pz+31)),0);
+            if(dx*dx+dz*dz>squared)count++;
+        }
+        return count;
+    }
+    private static long pageCount(int radius,int x,int z,int vertical){
+        long count=0,squared=(long)radius*radius;
+        for(int pz=Math.floorDiv(z-radius,32);pz<=Math.floorDiv(z+radius,32);pz++){
+            long first=(long)pz*32,dz=Math.max(Math.max(first-z,z-(first+31)),0);
+            int reach=(int)Math.sqrt(squared-dz*dz),left=Math.floorDiv(x-reach,32),right=Math.floorDiv(x+reach,32);
+            count+=right-left+1;
+        }
+        return count*vertical;
+    }
     public boolean remote(){return remote;}
     public long revision(){return revision;}
     private static int meshIndex(long node){int l=(int)(node>>>60),w=16>>l,offset=(32768-(32768>>(3*l)))/7;return offset+((ny(node)&(w-1))*w+(nz(node)&(w-1)))*w+(nx(node)&(w-1));}
@@ -56,9 +92,13 @@ public final class CoverageStore {
     public void prepareMesh(long node){
         int l=(int)(node>>>60);if(l==0)return;
         int x=nx(node)<<(l+1),y=ny(node)<<(l+1),z=nz(node)<<(l+1);
+        int width=2<<l;
+        long dx=Math.max(Math.max((long)x-centerX,(long)centerX-(x+width-1)),0);
+        long dz=Math.max(Math.max((long)z-centerZ,(long)centerZ-(z+width-1)),0);
+        if(remote&&radius>=0&&(radius==0||dx*dx+dz*dz>(long)radius*radius))return;
         if(pages.containsKey(pageKey(x,y,z)))return;
         long started=DebugLog.start();
-        try{synchronized(this){page(x,y,z);}}finally{DebugLog.end(DebugLog.Metric.CLIENT_COVERAGE_MESH_LOAD,started);}
+        try{synchronized(this){page(x,y,z,true);}}finally{DebugLog.end(DebugLog.Metric.CLIENT_COVERAGE_MESH_LOAD,started);}
         if(DebugLog.mesh())DebugLog.log("CLIENT mesh_coverage_load node={} level={} page={} can_split={} elapsed_ms={}",node,l,pageKey(x,y,z),canSplit(node),started==0?0:DebugLog.millis(System.nanoTime()-started));
     }
     public void meshBegin(int x,int z,int min,int max){if(writeDepth++==0)meshToggle(x,z,min,max);}
@@ -85,9 +125,14 @@ public final class CoverageStore {
     private static int nz(long k){return (int)((k<<12)>>40);}
     private static byte[] key(long id){return ByteBuffer.allocate(9).put((byte)1).putLong(id).array();}
     private static byte[] guard(long id){return ByteBuffer.allocate(9).put((byte)3).putLong(id).array();}
-    private Page page(int x,int y,int z) {
+    private Page page(int x,int y,int z){return page(x,y,z,false);}
+    private Page page(int x,int y,int z,boolean meshLoad) {
         long id=pageKey(x,y,z);Page p=lru.get(id);if(p!=null)return p;
-        while(lru.size()>=maxPages) {
+        if(lru.size()>maxPages){
+            if(meshLoad)return null;
+            pressure=true;
+        }
+        while(lru.size()==maxPages) {
             var it=lru.entrySet().iterator();boolean removed=false;
             while(it.hasNext()) {
                 var e=it.next();int px=nx(e.getKey())*32,pz=nz(e.getKey())*32;
@@ -96,7 +141,11 @@ public final class CoverageStore {
                 if(changedPages.contains(e.getKey()))continue;
                 var next=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>(pages);next.remove(e.getKey().longValue());pages=next;it.remove();removed=true;break;
             }
-            if(!removed)throw new IllegalStateException("活动覆盖索引超过预算，请减小范围或增加 indexMemoryMiB");
+            if(!removed){
+                if(meshLoad){pressure=true;return null;}
+                // An accepted column may still be saving. Keep its page until the checkpoint can evict it.
+                pressure=true;break;
+            }
         }
         p=new Page();byte[] bytes=database.join().get(key(id));
         if(bytes!=null){var b=ByteBuffer.wrap(bytes);p.restricted=b.get()!=0;for(int i=0;i<32768;i++){p.minimum[i]=b.get();p.versions[i]=b.getLong();if(p.minimum[i]==5&&p.versions[i]!=0)p.minimum[i]=STALE_MISSING;}}
@@ -189,13 +238,26 @@ public final class CoverageStore {
     public synchronized void checkpoint(Runnable flushVoxels){
         var ready=new ArrayList<Long>();
         for(long id:changedPages){var pending=pendingSaves.get(id);if(pending==null||pending.isEmpty())ready.add(id);}
-        if(ready.isEmpty())return;
+        if(ready.isEmpty()){trimExcess();return;}
         long started=DebugLog.start();
         try{flushVoxels.run();}finally{DebugLog.end(DebugLog.Metric.CLIENT_STORAGE_FLUSH,started);}
         var batch=new HashMap<byte[],byte[]>();var db=database.join();
         for(long id:ready){batch.put(key(id),encode(lru.get(id)));batch.put(guard(id),new byte[]{0});if(batch.size()==32){db.batch(batch);batch.clear();}}
         if(!batch.isEmpty())db.batch(batch);db.sync();
         for(long id:ready){changedPages.remove(id);unsafePages.remove(id);pendingSaves.remove(id);}
+        trimExcess();
+    }
+    private void trimExcess(){
+        while(lru.size()>maxPages){
+            var it=lru.entrySet().iterator();boolean removed=false;
+            while(it.hasNext()){
+                var e=it.next();int px=nx(e.getKey())*32,pz=nz(e.getKey())*32;
+                long dx=Math.max(Math.max(px-centerX,centerX-(px+31)),0),dz=Math.max(Math.max(pz-centerZ,centerZ-(pz+31)),0);
+                if(remote&&dx*dx+dz*dz<=(long)radius*radius||changedPages.contains(e.getKey()))continue;
+                var next=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>(pages);next.remove(e.getKey().longValue());pages=next;it.remove();removed=true;break;
+            }
+            if(!removed)break;
+        }
     }
     public record Stamp(long version,int level){}
     public synchronized Stamp column(int x,int z,int min,int max) {

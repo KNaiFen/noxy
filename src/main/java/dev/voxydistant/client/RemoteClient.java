@@ -8,7 +8,9 @@ import dev.voxydistant.config.*;
 import dev.voxydistant.data.*;
 import dev.voxydistant.generation.*;
 import dev.voxydistant.network.Protocol;
+import me.cortex.voxy.client.VoxyClientInstance;
 import me.cortex.voxy.common.world.WorldEngine;
+import me.cortex.voxy.commonImpl.WorldIdentifier;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.Connection;
 import net.minecraft.core.SectionPos;
@@ -17,6 +19,9 @@ import net.minecraft.world.level.chunk.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.nio.file.Files;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 
 /** Single ordered apply lane, bounded by reserved decoded memory. Main thread owns requests only. */
 public final class RemoteClient {
@@ -31,6 +36,10 @@ public final class RemoteClient {
     private static net.minecraft.client.multiplayer.ClientLevel lightLevel;
     private static final Set<Long> lightReady=new HashSet<>();
     private static long cacheBytes=-1,cacheColumns=-1,lastCacheRequest;
+    private static volatile String localCacheStatus="本机缓存：查询中…";
+    private static long lastLocalCacheRequest;
+    private static String localCacheWorld;
+    private static CompletableFuture<?> localCacheTask;
     public static void maintenance(Protocol.Maintenance message) {
         if(maintenancePaused==message.paused())return;
         maintenancePaused=message.paused();
@@ -101,7 +110,7 @@ public final class RemoteClient {
         boolean checkpointPending;
         boolean activePending;int activeX,activeZ,activeRadius;
         final DistanceBands bands;volatile int epoch=++sequence;volatile boolean closed;
-        NearbyChunks scan;Long scanHeld;int x=Integer.MIN_VALUE,z,radius,view,ticks,generation,scanBudget,requestBudget,preempted;volatile long applied,received;long requestSequence;
+        NearbyChunks scan;Long scanHeld;int x=Integer.MIN_VALUE,z,radius,requestedRadius,view,ticks,generation,scanBudget,requestBudget,preempted,indexMiB=DistantConfig.INDEX_MIB.get(),lastPressureTick=-200;volatile long applied,received;long requestSequence;
         boolean refillQueued;
         long debugAt,requestIdleAt;String requestState="initializing";
         long rateAt,rateBytes,rateColumns;double receiveKiBPerSecond,receiveColumnsPerSecond;
@@ -176,8 +185,19 @@ public final class RemoteClient {
             }
         }
         if(!s.deferredDirty.isEmpty())return;
-        int radius=Math.min(s.hello.radius(),VoxyBridge.radiusChunks());if(DistantConfig.RECEIVE_RADIUS.get()>0)radius=Math.min(radius,DistantConfig.RECEIVE_RADIUS.get());
         int x=mc.player.chunkPosition().x,z=mc.player.chunkPosition().z,view=mc.options.renderDistance().get();
+        int requested=Math.min(s.hello.radius(),VoxyBridge.radiusChunks());if(DistantConfig.RECEIVE_RADIUS.get()>0)requested=Math.min(requested,DistantConfig.RECEIVE_RADIUS.get());
+        int indexMiB=DistantConfig.INDEX_MIB.get();
+        boolean indexChanged=s.indexMiB!=indexMiB;
+        if(indexChanged){VoxyBridge.coverage(s.engine).remote(s.hello.minY(),s.hello.maxY(),indexMiB);s.indexMiB=indexMiB;}
+        var coverage=VoxyBridge.coverage(s.engine);
+        boolean pressure=coverage.pressure();
+        if(pressure)s.lastPressureTick=s.ticks;
+        int radius=pressure?coverage.stepDown(requested,x,z)
+                :s.x!=x||s.z!=z||s.requestedRadius!=requested||indexChanged||s.radius<requested&&s.ticks-s.lastPressureTick>=200&&s.ticks%20==0
+                ?coverage.limitRadius(requested,x,z):s.radius;
+        s.requestedRadius=requested;
+        if(radius<requested&&s.ticks%100==0)mc.gui.setOverlayMessage(net.minecraft.network.chat.Component.literal("索引预算不足：实际远景 "+radius+" / "+requested+" 区块；详情见 VD 设置"),false);
         if(s.x!=x||s.z!=z||s.radius!=radius||s.view!=view) {
             if(DebugLog.enabled())DebugLog.log("CLIENT move epoch={} from_x={} from_z={} x={} z={} generation={} radius={} view={}",s.epoch,s.x,s.z,x,z,s.generation+1,radius,view);
             boolean teleport=s.x!=Integer.MIN_VALUE&&(Math.abs((long)x-s.x)>32||Math.abs((long)z-s.z)>32);
@@ -217,8 +237,48 @@ public final class RemoteClient {
         Session s=session;
         return s==null?"接收速度：无会话":String.format(Locale.ROOT,"接收速度 %.1f KiB/s · %.1f 列/秒",s.receiveKiBPerSecond,s.receiveColumnsPerSecond);
     }
+    public static String indexStatus(){
+        Session s=session;
+        if(s==null)return "覆盖索引：无远景会话";
+        var usage=VoxyBridge.coverage(s.engine).usage();
+        return String.format(Locale.ROOT,"覆盖索引 %d/%d 页 · %.0f%% · %.1f/%d MiB",
+                usage.pages(),usage.limit(),100.0*usage.pages()/usage.limit(),usage.pages()*350000.0/1048576,DistantConfig.INDEX_MIB.get());
+    }
+    public static String radiusStatus(){
+        Session s=session;
+        if(s==null)return "远景范围：无远景会话";
+        return "远景 请求 "+s.requestedRadius+" / 实际 "+s.radius+" 区块"
+                +(s.radius<s.requestedRadius?" · 索引预算不足，远处不显示":"");
+    }
+    public static void requestLocalCacheStats(){
+        Session s=session;
+        if(s==null){localCacheWorld=null;localCacheStatus="本机缓存：无远景会话";return;}
+        var base=((VoxyClientInstance)s.engine.instanceIn).getStorageBasePath().resolve(WorldIdentifier.of(s.level).getWorldId());
+        String world=base.toString();
+        if(!world.equals(localCacheWorld)){localCacheWorld=world;lastLocalCacheRequest=0;localCacheStatus="本机缓存：查询中…";}
+        long now=System.nanoTime();
+        if(localCacheTask!=null&&!localCacheTask.isDone()||lastLocalCacheRequest!=0&&now-lastLocalCacheRequest<TimeUnit.SECONDS.toNanos(60))return;
+        lastLocalCacheRequest=now;
+        s.engine.acquireRef();
+        localCacheTask=CompletableFuture.runAsync(()->{
+            try{
+                long bytes;
+                try(var files=Files.walk(base.resolve("storage"))){bytes=files.filter(Files::isRegularFile).mapToLong(path->{
+                    try{return Files.size(path);}catch(IOException e){throw new UncheckedIOException(e);}
+                }).sum();}
+                var columns=new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
+                s.engine.storage.iteratePositions(-1,key->columns.add(((long)WorldEngine.getLevel(key)<<48)
+                        |((long)(WorldEngine.getX(key)&0xffffff)<<24)|(WorldEngine.getZ(key)&0xffffff)));
+                if(session==s)localCacheStatus=String.format(Locale.ROOT,"本机 Voxy 缓存 %.1f MiB · %,d LOD 列（含各层）",bytes/1048576.0,columns.size());
+            }catch(IOException|RuntimeException e){
+                LOG.error("Voxy Distant local cache statistics failed",e);
+                if(session==s)localCacheStatus="本机缓存：统计失败（见 latest.log）";
+            }finally{s.engine.releaseRef();}
+        });
+    }
+    public static String localCacheStatus(){return localCacheStatus;}
     private static void requestMore(Session s) {
-        if(session!=s||s.closed||maintenancePaused)return;
+        if(session!=s||s.closed||maintenancePaused||s.radius==0||VoxyBridge.coverage(s.engine).overBudget())return;
         var mc=Minecraft.getInstance();
         int window=DistantConfig.REQUEST_WINDOW.get();
         s.requestState=mc.isPaused()?"paused":!s.deferredDirty.isEmpty()||!s.deferredReplies.isEmpty()||s.worker.getQueue().remainingCapacity()==0?"worker_queue":s.pending.size()>=window&&(s.scan==null||s.preempted>=16)?"request_window":s.requestBudget==0?"request_rate":s.memory.get()>DistantConfig.RECEIVE_MIB.get()*1048576L*3/4?"receive_memory":VoxyBridge.backedUp(s.engine)?"voxy_backlog":"scanning";
@@ -519,7 +579,7 @@ public final class RemoteClient {
         if(s.checkpointPending&&s.offer(()->{long timing=DebugLog.start();try{VoxyBridge.coverage(s.engine).checkpointIfDue(s.engine.storage::flush);}catch(RuntimeException e){failed(s,e);}finally{DebugLog.end(CLIENT_CHECKPOINT,timing);}}))s.checkpointPending=false;
     }
     public static boolean handles(WorldEngine world){Session s=session;return s!=null&&!s.closed&&s.engine==world;}
-    public static float renderRadiusSquared(){Session s=session;if(s==null||s.closed||s.radius==0)return -1;float blocks=s.radius*16f;return blocks*blocks;}
+    public static float renderRadiusSquared(){Session s=session;if(s==null||s.closed)return -1;float blocks=s.radius*16f;return blocks*blocks;}
     public static void lightPending(net.minecraft.client.multiplayer.ClientLevel level,int x,int z){
         if(lightLevel!=level){lightLevel=level;lightReady.clear();}
         lightReady.remove(ChunkPos.asLong(x,z));

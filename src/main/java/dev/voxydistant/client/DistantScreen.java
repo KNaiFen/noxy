@@ -35,7 +35,7 @@ public final class DistantScreen extends Screen {
             new Setting("接收半径（区块）", "0 自动跟随 Voxy 渲染距离，仍受服务器上限约束。", DistantConfig.RECEIVE_RADIUS),
             new Setting("下载 KiB/s", "0 自动使用服务器允许的速度，仍受全服和单人上限约束。", DistantConfig.DOWNLOAD_KBPS),
             new Setting("接收缓冲 MiB", "当前维度完整区块快照需接收缓冲至少为整列预留的 4 倍；原版主世界需 12 MiB。修改后重连生效。", DistantConfig.RECEIVE_MIB),
-            new Setting("索引缓存 MiB", "客户端覆盖索引的内存预算。", DistantConfig.INDEX_MIB),
+            new Setting("索引缓存 MiB", "客户端覆盖索引内存预算（最高 10240 MiB）；超出时自动缩短实际远景范围。", DistantConfig.INDEX_MIB),
             new Setting("处理占空比", "远景接收应用线程的工作占比。", DistantConfig.RECEIVE_DUTY),
             new Setting("请求窗口（列）", "最多允许多少列处于未完成请求状态。", DistantConfig.REQUEST_WINDOW));
     private static final List<Setting> DEBUG = List.of(
@@ -61,7 +61,7 @@ public final class DistantScreen extends Screen {
     @Override protected void init() { rebuild(); }
 
     private int contentWidth() { return Math.min(460, width - 24); }
-    private int visibleRows() { return Math.max(1, (height - 130) / 29); }
+    private int visibleRows() { return Math.max(1, (height - (page == 1 ? 176 : 130)) / 29); }
 
     private void rebuild() {
         clearWidgets();
@@ -172,6 +172,12 @@ public final class DistantScreen extends Screen {
                     graphics.renderTooltip(font, font.split(Component.literal(setting.label() + " · " + setting.hint()), Math.min(320, width - 24)), mouseX, mouseY);
             }
             graphics.drawString(font, "滚轮浏览 · " + (scroll + 1) + "–" + Math.min(scroll + visibleRows(), settings.size()) + " / " + settings.size(), left, height - 55, 0xAAAAAA);
+            if(page==1){
+                RemoteClient.requestLocalCacheStats();
+                graphics.drawString(font,font.plainSubstrByWidth(RemoteClient.radiusStatus(),span),left,height-105,0xFFCC66);
+                graphics.drawString(font,font.plainSubstrByWidth(RemoteClient.indexStatus(),span),left,height-92,0xDDDDDD);
+                graphics.drawString(font,font.plainSubstrByWidth(RemoteClient.localCacheStatus(),span),left,height-79,0xDDDDDD);
+            }
         } else {
             var state = GenerationController.status();
             if (height >= 205) {
@@ -179,6 +185,11 @@ public final class DistantScreen extends Screen {
                 RemoteClient.requestCacheStats();
                 graphics.drawString(font, font.plainSubstrByWidth(RemoteClient.receiveSpeed(), span), left, 126, 0xDDDDDD);
                 graphics.drawString(font, font.plainSubstrByWidth(RemoteClient.cacheStatus(), span), left, 139, 0xDDDDDD);
+                if(height>=220){
+                    graphics.drawString(font,font.plainSubstrByWidth(RemoteClient.radiusStatus(),span),left,152,0xFFCC66);
+                    graphics.drawString(font,font.plainSubstrByWidth(RemoteClient.indexStatus(),span),left,165,0xDDDDDD);
+                    if(height>=235){RemoteClient.requestLocalCacheStats();graphics.drawString(font,font.plainSubstrByWidth(RemoteClient.localCacheStatus(),span),left,178,0xDDDDDD);}
+                }
             }
         }
         if (!error.isEmpty()) graphics.drawCenteredString(font, font.plainSubstrByWidth(error, span), width / 2, height - 43, 0xFF7777);
