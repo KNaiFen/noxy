@@ -23,7 +23,7 @@ LOD 从首片传输到末片约 **175 秒**，平均约 **1,172 列/秒、5.38 M
 
 兼容 **Minecraft 1.20.1、Forge 47.4.0～47.x、Java 21**。
 下载：从 [发行页](https://github.com/KNaiFen/noxy/releases) 下载 jar 文件。
-客户端安装本项目、[Voxy Forge 1.20.1 0.2.15-beta](https://github.com/KNaiFen/voxy-forge-1.20.1/releases/tag/forge-1.20.1-upstream-9a2110caa657)（下载不带 `-dev` 后缀的 JAR；[源码仓库](https://github.com/KNaiFen/voxy-forge-1.20.1)）和 [Embeddium 0.3.31](https://modrinth.com/mod/embeddium/version/UTbfe5d1)；
+客户端安装本项目、[Voxy Forge 1.20.1 0.2.15-beta（Windows/Linux x64）](https://github.com/KNaiFen/voxy-forge-1.20.1/releases/tag/forge-1.20.1-win-linux-x64-upstream-9a2110caa657)（下载不带 `-dev` 后缀的 JAR；[源码仓库](https://github.com/KNaiFen/voxy-forge-1.20.1)）和 [Embeddium 0.3.31](https://modrinth.com/mod/embeddium/version/UTbfe5d1)；
 服务器只安装本项目即可。
 
 安装后即可使用；在原版“选项”页点击与 Distant Horizons 按钮同位置的 **VD** 小按钮进行设置。OP 等级 2 可在其中在线调整服务器设置。配置文件为 `config/voxy_distant.toml`。
