@@ -32,7 +32,7 @@ public final class DistantScreen extends Screen {
             new Setting("转换占空比（自定义）", "仅在 CUSTOM 预设下生效。", DistantConfig.DUTY));
     private static final List<Setting> RECEIVE = List.of(
             new Setting("接收服务端远景", "接收兼容服务器发送的 LOD 列。", DistantConfig.RECEIVE),
-            new Setting("接收半径（区块）", "0 自动跟随 Voxy 渲染距离，仍受服务器上限约束。", DistantConfig.RECEIVE_RADIUS),
+            new Setting("接收半径（区块）", "0 跟随 Voxy 视距；填更大值可提前下载并缓存远景，显示距离仍由 Voxy 控制。仍受服务器和索引预算限制。", DistantConfig.RECEIVE_RADIUS),
             new Setting("下载 KiB/s", "0 自动使用服务器允许的速度，仍受全服和单人上限约束。", DistantConfig.DOWNLOAD_KBPS),
             new Setting("接收缓冲 MiB", "当前维度完整区块快照需接收缓冲至少为整列预留的 4 倍；原版主世界需 12 MiB。修改后重连生效。", DistantConfig.RECEIVE_MIB),
             new Setting("索引缓存 MiB", "客户端覆盖索引内存预算（最高 10240 MiB）；超出时自动缩短实际远景范围。", DistantConfig.INDEX_MIB),

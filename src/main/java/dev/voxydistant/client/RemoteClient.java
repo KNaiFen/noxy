@@ -186,7 +186,8 @@ public final class RemoteClient {
         }
         if(!s.deferredDirty.isEmpty())return;
         int x=mc.player.chunkPosition().x,z=mc.player.chunkPosition().z,view=mc.options.renderDistance().get();
-        int requested=Math.min(s.hello.radius(),VoxyBridge.radiusChunks());if(DistantConfig.RECEIVE_RADIUS.get()>0)requested=Math.min(requested,DistantConfig.RECEIVE_RADIUS.get());
+        int receiveRadius=DistantConfig.RECEIVE_RADIUS.get();
+        int requested=Math.min(s.hello.radius(),receiveRadius>0?receiveRadius:VoxyBridge.radiusChunks());
         int indexMiB=DistantConfig.INDEX_MIB.get();
         boolean indexChanged=s.indexMiB!=indexMiB;
         if(indexChanged){VoxyBridge.coverage(s.engine).remote(s.hello.minY(),s.hello.maxY(),indexMiB);s.indexMiB=indexMiB;}
@@ -247,8 +248,8 @@ public final class RemoteClient {
     public static String radiusStatus(){
         Session s=session;
         if(s==null)return "远景范围：无远景会话";
-        return "远景 请求 "+s.requestedRadius+" / 实际 "+s.radius+" 区块"
-                +(s.radius<s.requestedRadius?" · 索引预算不足，远处不显示":"");
+        return "远景 接收 "+s.radius+" / 请求 "+s.requestedRadius+" · 显示 "+Math.min(s.radius,VoxyBridge.radiusChunks())+" 区块"
+                +(s.radius<s.requestedRadius?" · 索引预算不足":"");
     }
     public static void requestLocalCacheStats(){
         Session s=session;
@@ -579,7 +580,7 @@ public final class RemoteClient {
         if(s.checkpointPending&&s.offer(()->{long timing=DebugLog.start();try{VoxyBridge.coverage(s.engine).checkpointIfDue(s.engine.storage::flush);}catch(RuntimeException e){failed(s,e);}finally{DebugLog.end(CLIENT_CHECKPOINT,timing);}}))s.checkpointPending=false;
     }
     public static boolean handles(WorldEngine world){Session s=session;return s!=null&&!s.closed&&s.engine==world;}
-    public static float renderRadiusSquared(){Session s=session;if(s==null||s.closed)return -1;float blocks=s.radius*16f;return blocks*blocks;}
+    public static float renderRadiusSquared(){Session s=session;if(s==null||s.closed)return -1;float blocks=Math.min(s.radius,VoxyBridge.radiusChunks())*16f;return blocks*blocks;}
     public static void lightPending(net.minecraft.client.multiplayer.ClientLevel level,int x,int z){
         if(lightLevel!=level){lightLevel=level;lightReady.clear();}
         lightReady.remove(ChunkPos.asLong(x,z));
