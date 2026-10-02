@@ -47,8 +47,13 @@ public final class DistantScreen extends Screen {
             new Setting("逐项网格日志", "独立的网格决策日志，网络排查时通常保持关闭。", DistantConfig.DEBUG_MESH),
             new Setting("汇总间隔（秒）", "诊断吞吐、队列、数据库和计时的汇总间隔。", DistantConfig.DEBUG_INTERVAL),
             new Setting("配置注释语言", "auto 跟随游戏或系统语言；重启后用于配置文件注释。", DistantConfig.CONFIG_LANGUAGE));
-    private static final List<List<Setting>> PAGES = List.of(LOCAL, RECEIVE, DEBUG);
-    private static final String[] TITLES = {"本地生成", "服务端接收", "诊断日志"};
+    private static final List<Setting> MOVEMENT=List.of(
+            new Setting("启用移动预测","同时用于服务端接收与单人本地生成；后侧最小半径 0.5 倍，前方最大长度 1.5 倍。",DistantConfig.MOVEMENT_PREDICTION),
+            new Setting("开始变形速度（格/秒）","持续移动 6 tick 后开始变形，默认 2.15。",DistantConfig.MOVEMENT_START),
+            new Setting("最大变形速度（格/秒）","默认 22，须大于开始速度；超过后形状不再变长，预测偏移仍使用实际速度。",DistantConfig.MOVEMENT_MAXIMUM),
+            new Setting("预测时长（秒）","当前位置加水平速度乘时长，默认 0.5；不预测转弯。",DistantConfig.MOVEMENT_SECONDS));
+    private static final List<List<Setting>> PAGES = List.of(LOCAL, RECEIVE, MOVEMENT, DEBUG);
+    private static final String[] TITLES = {"本地生成", "服务端接收", "移动预测", "诊断日志"};
     private final Screen parent;
     private final Map<ForgeConfigSpec.ConfigValue<?>, String> draft = new LinkedHashMap<>();
     private int page = -1;
@@ -77,7 +82,7 @@ public final class DistantScreen extends Screen {
                 }).bounds(left + (i % 2) * (span / 2 + 4), 48 + (i / 2) * 32, span / 2 - 4, 24).build());
             }
             addRenderableWidget(Button.builder(Component.literal("服务端设置  ›"), button -> minecraft.setScreen(new ServerConfigScreen(this)))
-                    .bounds(left + span / 2 + 4, 80, span / 2 - 4, 24).build());
+                    .bounds(left, 112, span, 24).build());
         } else {
             var settings = PAGES.get(page);
             int labelWidth = span * 3 / 5;
@@ -144,6 +149,7 @@ public final class DistantScreen extends Screen {
             if (!spec.test(result)) { error = setting.label() + "：有效范围 " + spec.getRange(); return; }
             parsed.put(value, result);
         }
+        if((double)parsed.get(DistantConfig.MOVEMENT_MAXIMUM)<=(double)parsed.get(DistantConfig.MOVEMENT_START)){error="最大变形速度必须大于开始变形速度";return;}
         if (minecraft.level != null && Boolean.TRUE.equals(parsed.get(DistantConfig.RECEIVE))) {
             try { DistantConfig.validateReceiveMemory(minecraft.level.getSectionsCount(),(int)parsed.get(DistantConfig.RECEIVE_MIB)); }
             catch (IllegalArgumentException ex) { error = ex.getMessage(); return; }

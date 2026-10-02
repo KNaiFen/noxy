@@ -24,7 +24,12 @@ public final class ClientEvents {
         bus.addListener(ClientEvents::unload);
     }
     private static void clientTick(TickEvent.ClientTickEvent event) {
-        if (event.phase == TickEvent.Phase.END) { RemoteClient.tick(); GenerationController.clientTick(); }
+        if (event.phase == TickEvent.Phase.END) {
+            var mc=net.minecraft.client.Minecraft.getInstance();var player=mc.player;
+            var config=new dev.voxydistant.movement.MovementPrediction.Settings(dev.voxydistant.config.DistantConfig.MOVEMENT_PREDICTION.get(),dev.voxydistant.config.DistantConfig.MOVEMENT_START.get(),dev.voxydistant.config.DistantConfig.MOVEMENT_MAXIMUM.get(),dev.voxydistant.config.DistantConfig.MOVEMENT_SECONDS.get());
+            dev.voxydistant.movement.MovementPrediction.CLIENT.sample(mc.level,player==null?0:player.getX(),player==null?0:player.getZ(),mc.isPaused()||mc.screen!=null&&mc.screen.isPauseScreen(),config);
+            RemoteClient.tick(); GenerationController.clientTick();
+        }
     }
     private static void unload(net.minecraftforge.event.level.ChunkEvent.Unload event) {
         if(event.getLevel().isClientSide()&&event.getChunk() instanceof net.minecraft.world.level.chunk.LevelChunk chunk)RemoteClient.unload(chunk);

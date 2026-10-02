@@ -9,7 +9,7 @@ import java.nio.file.Files;
 import java.util.List;
 
 public final class DistantConfig {
-    public static final int CURRENT_CONFIG_VERSION = 6;
+    public static final int CURRENT_CONFIG_VERSION = 7;
     private static net.minecraftforge.fml.config.ModConfig registered;
     public enum Preset { MINIMAL, LOW, BALANCED, AGGRESSIVE, FULL, CUSTOM }
     public record Limits(int threads, int concurrency, int perSecond, double snapshotMillis, double dutyCycle) {}
@@ -22,6 +22,8 @@ public final class DistantConfig {
     public static final ForgeConfigSpec.EnumValue<Preset> PRESET;
     public static final ForgeConfigSpec.IntValue RADIUS, THREADS, CONCURRENCY, PER_SECOND, QUEUE, MEMORY, LOCAL_SCAN_COLUMNS_PER_TICK;
     public static final ForgeConfigSpec.DoubleValue SNAPSHOT_MS, DUTY;
+    public static final ForgeConfigSpec.BooleanValue MOVEMENT_PREDICTION;
+    public static final ForgeConfigSpec.DoubleValue MOVEMENT_START, MOVEMENT_MAXIMUM, MOVEMENT_SECONDS;
     public static final ForgeConfigSpec.BooleanValue RECEIVE, SERVER_ENABLED, SERVER_GENERATE, AUTO_THROTTLE;
     public static final ForgeConfigSpec.IntValue RECEIVE_RADIUS, DOWNLOAD_KBPS, RECEIVE_MIB, INDEX_MIB, REQUEST_WINDOW,
             REQUEST_COLUMNS_PER_TICK, REGION_QUERY_WINDOW;
@@ -49,6 +51,12 @@ public final class DistantConfig {
         REGION_QUERY_WINDOW = b.comment(ConfigLanguage.comment("REGION_QUERY_WINDOW")).defineInRange("regionQueryWindow", 4, 1, dev.voxydistant.network.Protocol.MAX_REGION_QUERIES);
         INDEX_MIB = b.comment(ConfigLanguage.comment("INDEX_MIB")).defineInRange("indexMemoryMiB", 256, 16, 10240);
         RECEIVE_DUTY = b.comment(ConfigLanguage.comment("RECEIVE_DUTY")).defineInRange("processingDutyCycle", 1.0, 0.05, 1.0);
+        b.push("movementPrediction");
+        MOVEMENT_PREDICTION=b.comment(ConfigLanguage.comment("MOVEMENT_PREDICTION")).define("enabled",true);
+        MOVEMENT_START=b.comment(ConfigLanguage.comment("MOVEMENT_START")).defineInRange("startSpeed",2.15,.1,200);
+        MOVEMENT_MAXIMUM=b.comment(ConfigLanguage.comment("MOVEMENT_MAXIMUM")).defineInRange("maximumSpeed",22.0,.2,400);
+        MOVEMENT_SECONDS=b.comment(ConfigLanguage.comment("MOVEMENT_SECONDS")).defineInRange("predictionSeconds",.5,0,5);
+        b.pop();
         b.push("localGeneration");
         ENABLED = b.comment(ConfigLanguage.comment("ENABLED")).define("enabled", true);
         RADIUS = b.comment(ConfigLanguage.comment("RADIUS")).defineInRange("radius", 128, 1, 2048);
@@ -152,6 +160,7 @@ public final class DistantConfig {
     }
 
     public static void validate() {
+        if(MOVEMENT_MAXIMUM.get()<=MOVEMENT_START.get())throw new IllegalArgumentException("最大变形速度必须大于开始变形速度");
         if(IMPORT_MEMORY.get()!=0&&IMPORT_MEMORY.get()<64)throw new IllegalArgumentException("导入快照内存必须为 0 或 64～4096 MiB");
         DistanceBands.parse(BANDS.get());
         if (!(RESUME_MS.get() < SLOW_MS.get() && SLOW_MS.get() < PAUSE_MS.get()) || RESUME_TPS.get() < PAUSE_TPS.get())
