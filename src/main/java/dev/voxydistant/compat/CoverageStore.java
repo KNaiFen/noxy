@@ -18,6 +18,19 @@ public final class CoverageStore {
     private final CompletableFuture<LodDatabase> database;
     private volatile it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<Page> pages = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();
     private final LinkedHashMap<Long, Page> lru = new LinkedHashMap<>(16,.75f,true);
+    private final LinkedHashMap<Long,Directory> directories=new LinkedHashMap<>(16,.75f,true);
+    private long directoryReads,directoryMigrations;
+    public record DirectoryUsage(long reads,long migrations,int cached){}
+    public synchronized DirectoryUsage directoryUsage(){return new DirectoryUsage(directoryReads,directoryMigrations,directories.size());}
+    public static final class Directory {
+        public final long[] versions=new long[1024];
+        public final byte[] levels=new byte[1024];
+        final int min,max;
+        Directory(int min,int max){this.min=min;this.max=max;Arrays.fill(levels,(byte)5);}
+        public Stamp column(int slot){return new Stamp(versions[slot],levels[slot]);}
+        byte[] encode(){var b=ByteBuffer.allocate(8+1024*9).putInt(min).putInt(max);for(int i=0;i<1024;i++)b.putLong(versions[i]).put(levels[i]);return b.array();}
+        static Directory decode(byte[] bytes){var b=ByteBuffer.wrap(bytes);var d=new Directory(b.getInt(),b.getInt());for(int i=0;i<1024;i++){d.versions[i]=b.getLong();d.levels[i]=b.get();}return d;}
+    }
     private final Set<Long> unsafePages = new HashSet<>();
     private final Set<Long> changedPages = new HashSet<>();
     private volatile boolean pressure;
@@ -42,6 +55,8 @@ public final class CoverageStore {
         volatile long explorationRevision;
         final java.util.concurrent.atomic.AtomicLongArray meshes=new java.util.concurrent.atomic.AtomicLongArray(4681);
         final ConcurrentHashMap<Integer,RenderMask> renderMasks=new ConcurrentHashMap<>();
+        final BitSet directoryDirty=new BitSet(1024);
+        Directory directory;
         Page(){Arrays.fill(minimum,(byte)5);for(int l=1;l<=4;l++){counts[l-1]=new AtomicIntegerArray(32768>>(3*(l+1)));blockers[l-1]=new AtomicIntegerArray(32768>>(3*(l+1)));coarse[l-1]=new AtomicIntegerArray(32768>>(3*(l+1)));}}
     }
     private record RenderMask(long generation,byte children){}
@@ -49,7 +64,7 @@ public final class CoverageStore {
         this.path=path;
         database=CompletableFuture.supplyAsync(()->{var db=new LodDatabase(path.resolveSibling(path.getFileName()+".rocksdb"),8L<<20);migrate(db);return db;});
     }
-    public synchronized void remote(int min,int max,int memoryMiB){minY=min;maxY=max;maxPages=Math.max(8,(int)(memoryMiB*1048576L/350000));remote=true;}
+    public synchronized void remote(int min,int max,int memoryMiB){if(minY!=min||maxY!=max){directories.clear();for(var p:lru.values())p.directory=null;}minY=min;maxY=max;maxPages=Math.max(8,(int)(memoryMiB*1048576L/400000));remote=true;}
     public synchronized void active(int x,int z,int r){centerX=x;centerZ=z;radius=r;}
     public synchronized Usage usage(){return new Usage(lru.size(),maxPages);}
     public boolean pressure(){return pressure;}
@@ -125,6 +140,55 @@ public final class CoverageStore {
     private static int nz(long k){return (int)((k<<12)>>40);}
     private static byte[] key(long id){return ByteBuffer.allocate(9).put((byte)1).putLong(id).array();}
     private static byte[] guard(long id){return ByteBuffer.allocate(9).put((byte)3).putLong(id).array();}
+    private static byte[] directoryKey(long id){return ByteBuffer.allocate(9).put((byte)4).putLong(id).array();}
+    private Directory pageDirectory(long id,Page p){
+        int low=Math.max(minY,ny(id)*32),high=Math.min(maxY,ny(id)*32+32);
+        if(p.directory==null){p.directory=new Directory(low,high);p.directoryDirty.set(0,1024);}
+        for(int slot=p.directoryDirty.nextSetBit(0);slot>=0;slot=p.directoryDirty.nextSetBit(slot+1)){
+            long version=-1;int level=0;
+            for(int y=low;y<high;y++){int i=((y&31)<<10)|slot;long v=p.versions[i];if(version==-1)version=v;else if(version!=v){level=5;version=0;break;}level=Math.max(level,(p.minimum[i]&REFRESH_PENDING)!=0?5:p.minimum[i]&7);}
+            p.directory.versions[slot]=Math.max(0,version);p.directory.levels[slot]=(byte)level;
+        }
+        p.directoryDirty.clear();return p.directory;
+    }
+    /** Does not create render pages. A null result asks the scheduler to migrate one legacy page. */
+    public synchronized Directory directory(int rx,int rz,boolean migrate){
+        var result=new Directory(minY,maxY);boolean first=true;
+        for(int py=Math.floorDiv(minY,32);py<=Math.floorDiv(maxY-1,32);py++){
+            long id=node(4,rx,py,rz);int low=Math.max(minY,py*32),high=Math.min(maxY,py*32+32);
+            Page p=lru.get(id);Directory d=p==null?directories.get(id):pageDirectory(id,p);
+            if(d==null){
+                directoryReads++;var db=database.join();byte[] unsafe=db.get(guard(id)),bytes=db.get(directoryKey(id));
+                if(unsafe!=null&&unsafe[0]!=0)d=new Directory(low,high);
+                else if(bytes!=null){d=Directory.decode(bytes);if(d.min!=low||d.max!=high)d=null;}
+                if(d==null){
+                    byte[] raw=db.get(key(id));
+                    if(raw!=null&&!migrate)return null;
+                    d=new Directory(low,high);
+                    if(raw!=null){
+                        for(int slot=0;slot<1024;slot++){
+                            long version=-1;int level=0;
+                            for(int y=low;y<high;y++){int at=1+(((y&31)<<10)|slot)*9,value=raw[at]&255;long v=ByteBuffer.wrap(raw,at+1,8).getLong();if(version==-1)version=v;else if(version!=v){level=5;version=0;break;}level=Math.max(level,(value&REFRESH_PENDING)!=0?5:value&7);}
+                            d.versions[slot]=Math.max(0,version);d.levels[slot]=(byte)level;
+                        }
+                        db.put(directoryKey(id),d.encode());directoryMigrations++;
+                        cacheDirectory(id,d);
+                        return null; // Bound legacy reconstruction to one vertical page per task.
+                    }
+                    db.put(directoryKey(id),d.encode());
+                }
+                cacheDirectory(id,d);
+            }
+            for(int i=0;i<1024;i++){
+                if(first){result.versions[i]=d.versions[i];result.levels[i]=d.levels[i];}
+                else if(result.versions[i]!=d.versions[i]){result.versions[i]=0;result.levels[i]=5;}
+                else result.levels[i]=(byte)Math.max(result.levels[i],d.levels[i]);
+            }
+            first=false;
+        }
+        return result;
+    }
+    private void cacheDirectory(long id,Directory d){directories.put(id,d);while(directories.size()>maxPages*2)directories.remove(directories.keySet().iterator().next());}
     private Page page(int x,int y,int z){return page(x,y,z,false);}
     private Page page(int x,int y,int z,boolean meshLoad) {
         long id=pageKey(x,y,z);Page p=lru.get(id);if(p!=null)return p;
@@ -165,7 +229,7 @@ public final class CoverageStore {
     private static boolean blocksSplit(int value,int level){return (value&7)>=level&&value!=5;}
     private static boolean coarse(int value,int level){return (value&7)>=level&&(value&7)<=4;}
     private static void set(Page p,int x,int y,int z,int value,long version) {
-        int i=index(x,y,z),before=p.minimum[i]&255,old=before&7,m=value&7;p.minimum[i]=(byte)value;p.versions[i]=version;
+        int i=index(x,y,z),before=p.minimum[i]&255,old=before&7,m=value&7;p.minimum[i]=(byte)value;p.versions[i]=version;p.directoryDirty.set(i&1023);
         for(int l=1;l<=4;l++){
             int c=counter(x,y,z,l);if((old<l)!=(m<l))p.counts[l-1].addAndGet(c,m<l?1:-1);
             boolean blocked=blocksSplit(value,l);if(blocksSplit(before,l)!=blocked)p.blockers[l-1].addAndGet(c,blocked?1:-1);
@@ -242,7 +306,7 @@ public final class CoverageStore {
         long started=DebugLog.start();
         try{flushVoxels.run();}finally{DebugLog.end(DebugLog.Metric.CLIENT_STORAGE_FLUSH,started);}
         var batch=new HashMap<byte[],byte[]>();var db=database.join();
-        for(long id:ready){batch.put(key(id),encode(lru.get(id)));batch.put(guard(id),new byte[]{0});if(batch.size()==32){db.batch(batch);batch.clear();}}
+        for(long id:ready){Page p=lru.get(id);Directory d=pageDirectory(id,p);batch.put(key(id),encode(p));batch.put(directoryKey(id),d.encode());batch.put(guard(id),new byte[]{0});cacheDirectory(id,d);if(batch.size()>=32){db.batch(batch);batch.clear();}}
         if(!batch.isEmpty())db.batch(batch);db.sync();
         for(long id:ready){changedPages.remove(id);unsafePages.remove(id);pendingSaves.remove(id);}
         trimExcess();
@@ -268,8 +332,8 @@ public final class CoverageStore {
     public synchronized boolean fullGroup(long k){int x=nx(k)*4,y=ny(k)*4,z=nz(k)*4;Page p=page(x,y,z);return p.counts[0].get(counter(x,y,z,1))==64;}
     public synchronized boolean isCoarse(long k){return page(nx(k)*4,ny(k)*4,nz(k)*4).restricted;}
     private static byte[] encode(Page p){var b=ByteBuffer.allocate(1+32768*9).put((byte)(p.restricted?1:0));for(int i=0;i<32768;i++)b.put(p.minimum[i]).putLong(p.versions[i]);return b.array();}
-    public synchronized void saveAfterWorldClosed(){var db=database.join();var batch=new HashMap<byte[],byte[]>();for(var e:lru.entrySet()){var pending=pendingSaves.get(e.getKey());if(pending!=null&&!pending.isEmpty()){if(DebugLog.enabled())for(long node:pending)DebugLog.log("CLIENT close_unconfirmed page={} node={} current_generation={}",e.getKey(),node,meshGeneration(node));continue;}batch.put(key(e.getKey()),encode(e.getValue()));batch.put(guard(e.getKey()),new byte[]{0});if(batch.size()==32){db.batch(batch);batch.clear();}}if(!batch.isEmpty())db.batch(batch);db.close();pages=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();lru.clear();}
-    public synchronized void closeUnconfirmed(){database.join().close();pages=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();lru.clear();}
+    public synchronized void saveAfterWorldClosed(){var db=database.join();var batch=new HashMap<byte[],byte[]>();for(var e:lru.entrySet()){var pending=pendingSaves.get(e.getKey());if(pending!=null&&!pending.isEmpty()){if(DebugLog.enabled())for(long node:pending)DebugLog.log("CLIENT close_unconfirmed page={} node={} current_generation={}",e.getKey(),node,meshGeneration(node));continue;}batch.put(key(e.getKey()),encode(e.getValue()));batch.put(directoryKey(e.getKey()),pageDirectory(e.getKey(),e.getValue()).encode());batch.put(guard(e.getKey()),new byte[]{0});if(batch.size()>=32){db.batch(batch);batch.clear();}}if(!batch.isEmpty())db.batch(batch);db.close();pages=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();lru.clear();directories.clear();}
+    public synchronized void closeUnconfirmed(){database.join().close();pages=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();lru.clear();directories.clear();}
     private void migrate(LodDatabase db) {
         if(!Files.exists(path)||db.get(new byte[]{2})!=null)return;
         try(var in=new DataInputStream(new BufferedInputStream(Files.newInputStream(path)))) {
