@@ -192,6 +192,10 @@ public final class RemoteServer {
         long created(){return created;}
     }
     private static final class Session {
+        final LinkedHashMap<Long,Protocol.RegionQuery> directories=new LinkedHashMap<>();
+        final Map<Long,Map<Integer,Long>> directoryChanges=new HashMap<>();
+        final ArrayDeque<Protocol.RegionSummary> directoryReplies=new ArrayDeque<>();
+        boolean directoryReading;
         final ServerPlayer player; final LinkedHashMap<Long, Protocol.Want> pending = new LinkedHashMap<>();
         final ArrayDeque<Transfer> send = new ArrayDeque<>(); final Map<Long,Credit> inflight = new HashMap<>();
         final LinkedHashMap<Long,Ready> ready=new LinkedHashMap<>();
@@ -275,7 +279,7 @@ public final class RemoteServer {
         boolean newEpoch=s.epoch!=r.epoch();
         if (newEpoch) {
             if(r.epoch()<s.epoch)return;
-            s.pending.clear();s.latestRequestIds.clear();s.latestRequestId=0; s.send.clear(); s.inflight.clear();s.ready.clear();s.batchCredit=0; s.bytes=0; s.reserved=0;
+            s.pending.clear();s.latestRequestIds.clear();s.latestRequestId=0; s.send.clear(); s.inflight.clear();s.ready.clear();s.directories.clear();s.directoryChanges.clear();s.directoryReplies.clear();s.batchCredit=0; s.bytes=0; s.reserved=0;
             for (Work w:work.values()) w.demands.removeIf(d -> {if(d.session!=s)return false;detach(w,d);return true;});
             s.epoch=r.epoch(); s.active=0;
         }
@@ -335,6 +339,11 @@ public final class RemoteServer {
         Key key=new Key(level.dimension(),x,z);
         Integer previousTick=self.lastChangeTick.put(key,self.ticks);if(previousTick!=null&&previousTick==self.ticks)return;
         long revision=self.sequence.incrementAndGet(); self.versions.put(key,revision); self.dirty.put(key,revision);
+        for(var s:self.players.values())if(s.dimension==key.dimension){
+            int slot=(x&31)|((z&31)<<5);
+            for(var q:s.directories.values())if(q.x()==(x>>5)&&q.z()==(z>>5))s.directoryChanges.computeIfAbsent(q.id(),id->new HashMap<>()).put(slot,revision);
+            for(var summary:s.directoryReplies)if(summary.x()==(x>>5)&&summary.z()==(z>>5))summary.masks()[slot]=0;
+        }
     }
     public static void vanillaSent(ServerPlayer player,int x,int z) {
         RemoteServer self=instance; if (self==null) return;
@@ -601,6 +610,7 @@ public final class RemoteServer {
         if(exclusiveImport()||importStorageFailed)return;
         if(configChange!=null || database==null || !DistantConfig.SERVER_ENABLED.get())return;
         if(dirtyWrites.get()>8 || workers.getQueue().size()>DistantConfig.SERVER_QUEUE.get())return;
+        scheduleDirectories(limits);
         var sessions=new ArrayList<>(players.values()); if(sessions.isEmpty())return;
         int attempts=0,idle=0;
         while(attempts++<sessions.size()*limits.concurrency() && cacheTokens>=1 && cacheActive<limits.concurrency() && work.size()<DistantConfig.SERVER_QUEUE.get()) {
@@ -656,6 +666,45 @@ public final class RemoteServer {
                     });
                 }catch(RuntimeException e){complete(()->{fail(e);finish(w,1);});}
             });
+        }
+    }
+    public static void regionQuery(ServerPlayer player,Protocol.RegionQuery query){
+        var self=instance;if(self==null||self.stopping)return;var s=self.players.get(player.getUUID());
+        if(s==null||query.epoch()!=s.epoch||s.directories.size()+s.directoryReplies.size()>=4)return;
+        long dx=Math.max(Math.max((long)query.x()*32-player.chunkPosition().x,(long)player.chunkPosition().x-((long)query.x()*32+31)),0),
+                dz=Math.max(Math.max((long)query.z()*32-player.chunkPosition().z,(long)player.chunkPosition().z-((long)query.z()*32+31)),0);
+        if(dx*dx+dz*dz>(long)s.radius*s.radius)return;
+        s.directories.put(query.id(),query);self.schedule(DistantConfig.serverLimits());
+    }
+    private int directoryCursor;
+    private void scheduleDirectories(DistantConfig.Limits limits){
+        var sessions=new ArrayList<>(players.values());
+        if(cacheActive>=Math.max(1,limits.concurrency()/2))return;
+        for(int n=0;n<sessions.size();n++){
+            var s=sessions.get(Math.floorMod(directoryCursor++,sessions.size()));
+            if(s.directoryReading||s.directories.isEmpty()||cacheTokens<1||cacheActive>=limits.concurrency()
+                    ||s.cacheActive>=DistantConfig.PLAYER_CONCURRENCY.get()||totalQueuedBytes()+65536>DistantConfig.TOTAL_SEND_MIB.get()*1048576L
+                    ||s.bytes+s.encodingBytes+s.cacheReadBytes+65536>DistantConfig.PLAYER_SEND_MIB.get()*1048576L)continue;
+            var query=s.directories.values().iterator().next();s.directoryReading=true;cacheActive++;s.cacheActive++;cacheTokens--;
+            cacheReadMemory+=65536;s.cacheReadBytes+=65536;
+            var dimension=s.dimension;var db=database;
+            workers.execute(()->{
+                try{
+                    boolean ready=db.prepareRegion(dimension.location().toString(),query.x(),query.z());
+                    var entries=ready?db.region(dimension.location().toString(),query.x(),query.z()):null;
+                    complete(()->{
+                        cacheActive--;s.cacheActive--;s.directoryReading=false;
+                        cacheReadMemory-=65536;s.cacheReadBytes-=65536;
+                        if(players.get(s.player.getUUID())!=s||query.epoch()!=s.epoch||s.directories.get(query.id())!=query)return;
+                        if(!ready){s.directories.remove(query.id());s.directories.put(query.id(),query);return;}
+                        s.directories.remove(query.id());long[] versions=new long[1024];byte[] masks=new byte[1024];
+                        var changes=s.directoryChanges.remove(query.id());
+                        for(int i=0;i<1024;i++){var meta=entries[i];int x=query.x()*32+(i&31),z=query.z()*32+(i>>5);long latest=Math.max(Math.max(meta.invalid(),this.versions.getOrDefault(new Key(dimension,x,z),0L)),changes==null?0:changes.getOrDefault(i,0L));versions[i]=meta.version();if(meta.mask()!=0&&meta.version()>=latest)masks[i]=(byte)meta.mask();}
+                        s.directoryReplies.add(new Protocol.RegionSummary(query.epoch(),query.id(),query.x(),query.z(),versions,masks));s.bytes+=16384;
+                    });
+                }catch(RuntimeException e){complete(()->{cacheActive--;s.cacheActive--;cacheReadMemory-=65536;s.cacheReadBytes-=65536;s.directoryReading=false;s.directories.remove(query.id());fail(e);});}
+            });
+            break;
         }
     }
     private void readCachedColumn(Work w,DistantConfig.Limits limits,int cacheMask,LodDatabase.Metadata meta){
@@ -1122,6 +1171,13 @@ public final class RemoteServer {
         }
         while(!sessions.isEmpty() && totalBudget.available()>128 && attempts<sessions.size()*256 && idle<sessions.size()) {
             Session s=sessions.get(Math.floorMod(sendCursor++,sessions.size()));attempts++;idle++;
+            if(!s.directoryReplies.isEmpty()&&s.budget.available()>=9236&&totalBudget.available()>=9236){
+                var summary=s.directoryReplies.remove();s.bytes-=16384;
+                if(summary.epoch()==s.epoch){
+                    for(int i=0;i<1024;i++){long latest=versions.getOrDefault(new Key(s.dimension,summary.x()*32+(i&31),summary.z()*32+(i>>5)),0L);if(latest>summary.versions()[i])summary.masks()[i]=0;}
+                    Protocol.send(s.player,summary);s.budget.spend(9236);totalBudget.spend(9236);sentBytes+=9236;s.sent+=9236;idle=0;
+                }
+            }
             selectTransfer(s);Transfer t=s.send.peek();if(t==null)continue;
             var inflightCredit=s.inflight.get(t.id);var cancelled=inflightCredit==null?t.cancelled:inflightCredit.cancelled;
             boolean stale=t.members.isEmpty()?(!inRange(s,t.key.x,t.key.z)||t.version<versions.getOrDefault(t.key,0L)):t.members.stream().anyMatch(m->(cancelled==null||!cancelled.contains(m))&&(!inRange(s,m.x(),m.z())||m.version()<versions.getOrDefault(new Key(s.dimension,m.x(),m.z()),0L)));
@@ -1196,6 +1252,7 @@ public final class RemoteServer {
     }
     private void countCacheStep(LodDatabase db){
         workers.execute(()->{
+            if(stopping||database!=db||configChange!=null){countingCache.set(false);return;}
             try{boolean done=db.countCachedColumnsStep();server.execute(()->{if(done||stopping||database!=db)countingCache.set(false);else countCacheStep(db);});}
             catch(RuntimeException ex){countingCache.set(false);server.execute(()->fail(ex));}
         });

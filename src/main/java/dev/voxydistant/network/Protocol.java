@@ -23,9 +23,9 @@ public final class Protocol {
         return total+raw*3L+scratch;
     }
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(new ResourceLocation("voxy_distant", "lod"),
-            () -> "15", Protocol::compatible, Protocol::compatible);
+            () -> "16", Protocol::compatible, Protocol::compatible);
     private static boolean compatible(String version) {
-        return version.equals("15") || version.equals(NetworkRegistry.ABSENT) || version.equals(NetworkRegistry.ACCEPTVANILLA);
+        return version.equals("16") || version.equals(NetworkRegistry.ABSENT) || version.equals(NetworkRegistry.ACCEPTVANILLA);
     }
     public record Hello(UUID world,String dimension, int radius, int minY, int maxY, List<String> bands) {}
     public record Maintenance(boolean paused) {}
@@ -52,8 +52,14 @@ public final class Protocol {
     public record ConfigResult(long id,long revision,boolean success,String message,List<String> values) {}
     public record CacheStatsRequest() {}
     public record CacheStats(long bytes,long columns) {}
+    public record RegionQuery(int epoch,long id,int x,int z) {}
+    public record RegionSummary(int epoch,long id,int x,int z,long[] versions,byte[] masks) {}
 
     public static void register() {
+        CHANNEL.registerMessage(13,RegionQuery.class,(m,b)->{b.writeInt(m.epoch);b.writeLong(m.id);b.writeInt(m.x);b.writeInt(m.z);},
+                b->new RegionQuery(b.readInt(),b.readLong(),b.readInt(),b.readInt()),(m,c)->{var ctx=c.get();ctx.enqueueWork(()->RemoteServer.regionQuery(ctx.getSender(),m));ctx.setPacketHandled(true);},Optional.of(NetworkDirection.PLAY_TO_SERVER));
+        CHANNEL.registerMessage(14,RegionSummary.class,Protocol::writeRegion,Protocol::readRegion,
+                (m,c)->client(c,()->RemoteClient.regionSummary(m)),Optional.of(NetworkDirection.PLAY_TO_CLIENT));
         CHANNEL.registerMessage(10, Maintenance.class, (m,b)->b.writeBoolean(m.paused), b->new Maintenance(b.readBoolean()),
                 (m,c)->client(c,()->RemoteClient.maintenance(m)), Optional.of(NetworkDirection.PLAY_TO_CLIENT));
         CHANNEL.registerMessage(0, Hello.class, (m,b) -> {
@@ -108,6 +114,15 @@ public final class Protocol {
         CHANNEL.registerMessage(12,CacheStats.class,(m,b)->{b.writeLong(m.bytes);b.writeLong(m.columns);},
                 b->new CacheStats(b.readLong(),b.readLong()),
                 (m,c)->{var ctx=c.get();ctx.enqueueWork(()->DistExecutor.unsafeRunWhenOn(Dist.CLIENT,()->()->RemoteClient.cacheStats(ctx.getNetworkManager(),m)));ctx.setPacketHandled(true);},Optional.of(NetworkDirection.PLAY_TO_CLIENT));
+    }
+    public static void writeRegion(RegionSummary m,FriendlyByteBuf b){
+        b.writeInt(m.epoch);b.writeLong(m.id);b.writeInt(m.x);b.writeInt(m.z);
+        for(int i=0;i<1024;i++){b.writeLong(m.versions[i]);b.writeByte(m.masks[i]);}
+    }
+    public static RegionSummary readRegion(FriendlyByteBuf b){
+        int epoch=b.readInt();long id=b.readLong();int x=b.readInt(),z=b.readInt();long[] versions=new long[1024];byte[] masks=new byte[1024];
+        for(int i=0;i<1024;i++){versions[i]=b.readLong();masks[i]=(byte)ColumnCodec.bounded(b.readUnsignedByte(),0,31);}
+        return new RegionSummary(epoch,id,x,z,versions,masks);
     }
     public static void writeConfigRequest(ConfigRequest m,FriendlyByteBuf b){b.writeLong(m.id);b.writeBoolean(m.save);b.writeLong(m.revision);writeSettings(b,m.values);}
     public static ConfigRequest readConfigRequest(FriendlyByteBuf b){return new ConfigRequest(b.readLong(),b.readBoolean(),b.readLong(),readSettings(b));}

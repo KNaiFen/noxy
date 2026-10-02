@@ -10,7 +10,7 @@ import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.List;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.*;
 
 /** The persisted 192-chunk cache used to compare restart scan latency. */
 class CacheScanBenchmarkTest {
@@ -41,6 +41,17 @@ class CacheScanBenchmarkTest {
         assertEquals(90080,fast.wants);
         assertEquals(0,fast.duplicates);
         assertEquals(0,fast.missed);
+        var cacheDirectory=new CoverageStore(file);cacheDirectory.remote(MIN_Y,MAX_Y,256);
+        var discovery=new RegionDiscovery(BANDS);long directoryStart=System.nanoTime();discovery.move(0,0,RADIUS);
+        for(var region:discovery.regions.values())discovery.local(region,cacheDirectory.directory(region.x,region.z,false));
+        double directoryMillis=(System.nanoTime()-directoryStart)/1e6;
+        long expected=0;for(var region:discovery.regions.values())expected+=region.needs.cardinality();
+        assertEquals(90080,expected);assertEquals(0,cacheDirectory.usage().pages());
+        var first=discovery.poll();assertNotNull(first);
+        long firstX=RegionDiscovery.x(first),firstZ=RegionDiscovery.z(first);
+        assertTrue(firstX*firstX+firstZ*firstZ>(long)CACHED*CACHED);
+        System.out.printf("directory discovery=%.1f ms (%.1f%% of fast scan), render pages=%d, regions=%d%n",directoryMillis,100*directoryMillis/fast.firstOuterMillis,cacheDirectory.usage().pages(),discovery.regions.size());
+        cacheDirectory.closeUnconfirmed();
         System.out.printf("192/256 cache scan: baseline first batch=%d (%.1f ms), fast first batch=%d (%.1f ms), fast wants=%d, duplicates=%d, missed=%d%n",
                 baseline.firstOuterBatch,baseline.firstOuterMillis,fast.firstOuterBatch,fast.firstOuterMillis,fast.wants,fast.duplicates,fast.missed);
     }

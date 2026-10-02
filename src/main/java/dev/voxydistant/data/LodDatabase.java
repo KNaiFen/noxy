@@ -63,6 +63,10 @@ public final class LodDatabase implements AutoCloseable {
         try { value=db.get(key);success=true;return value; } catch (RocksDBException e) { throw new IllegalStateException("LOD read failed", e); }
         finally { diagnostic(0,started,value==null?0:value.length,success,success&&value==null); }
     }
+    public boolean contains(byte[] key){
+        try{return db.get(key,new byte[0])!=RocksDB.NOT_FOUND;}
+        catch(RocksDBException e){throw new IllegalStateException("LOD key lookup failed",e);}
+    }
     public void put(byte[] key, byte[] value) {
         long started=DebugLog.start();boolean success=false;
         try { db.put(writes, key, value);success=true; } catch (RocksDBException e) { throw new IllegalStateException("LOD write failed", e); }
@@ -103,7 +107,13 @@ public final class LodDatabase implements AutoCloseable {
         }catch(IOException e){throw new UncheckedIOException("LOD cache size failed",e);}
     }
     public synchronized void importColumn(byte[] key,byte[] value,long version,int mask) {
-        storeColumn(key,value,version,mask);
+        // Import owns the terrain lane. A newer live invalidation stays dirty above this snapshot.
+        var before=metadata(key);boolean absent=before.mask()==0;
+        try(var batch=new WriteBatch()){
+            byte[] invalid=db.get(keyWithKind(key,2));
+            batch.put(key,value);batch.put(metadataKey(key),new Metadata(version,invalid==null?0:ByteBuffer.wrap(invalid).getLong(),mask).encode());
+            if(absent)addColumn(batch,key);db.write(writes,batch);if(absent)columnAdded(key);
+        }catch(RocksDBException e){throw new IllegalStateException("LOD import write failed",e);}
     }
 
     /** Region-major metadata keys make a directory one contiguous RocksDB range. */
@@ -224,17 +234,17 @@ public final class LodDatabase implements AutoCloseable {
         try (var batch = new WriteBatch()) {
             byte[] invalid=db.get(keyWithKind(key,2));
             if(invalid!=null && ByteBuffer.wrap(invalid).getLong()>version)return false;
-            byte[] stored=db.get(key);
-            if(stored!=null && metadata(key).version()>version)return false;
+            Metadata before=metadata(key);boolean absent=before.mask()==0;
+            if(before.version()>version)return false;
             batch.put(key, value);
             batch.put(metadataKey(key),new Metadata(version,invalid==null?0:ByteBuffer.wrap(invalid).getLong(),mask).encode());
-            if(stored==null)addColumn(batch,key);
+            if(absent)addColumn(batch,key);
             for (int kind = 3; kind <= 4; kind++) {
                 byte[] pendingKey = keyWithKind(key, kind), pending = db.get(pendingKey);
                 if (pending != null && ByteBuffer.wrap(pending).getLong() <= version) batch.delete(pendingKey);
             }
             db.write(writes, batch);
-            if(stored==null)columnAdded(key);
+            if(absent)columnAdded(key);
             return true;
         } catch (RocksDBException e) { throw new IllegalStateException("LOD column write failed", e); }
     }

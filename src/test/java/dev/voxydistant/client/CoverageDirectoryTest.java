@@ -37,4 +37,15 @@ class CoverageDirectoryTest {
         assertEquals(0,cache.usage().pages());
         cache.closeUnconfirmed();
     }
+    @Test void legacyPagesMigrateOneAtATimeWithoutRebuildingRenderCounters()throws Exception{
+        Path file=directory.resolve("legacy.bin");var cache=new CoverageStore(file);cache.remote(-4,40,256);
+        for(int y=-4;y<40;y++)cache.received(0,y,0,12,3,true);cache.saveAfterWorldClosed();
+        try(var options=new org.rocksdb.Options();var db=org.rocksdb.RocksDB.open(options,file.resolveSibling("legacy.bin.rocksdb").toString())){
+            for(int py=-1;py<=1;py++)db.delete(java.nio.ByteBuffer.allocate(9).put((byte)4).putLong(CoverageStore.node(4,0,py,0)).array());
+        }
+        cache=new CoverageStore(file);cache.remote(-4,40,256);assertNull(cache.directory(0,0,false));
+        for(int i=0;i<3;i++)assertNull(cache.directory(0,0,true));
+        assertEquals(new CoverageStore.Stamp(12,3),cache.directory(0,0,true).column(0));
+        assertEquals(3,cache.directoryUsage().migrations());assertEquals(0,cache.usage().pages());cache.closeUnconfirmed();
+    }
 }

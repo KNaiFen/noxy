@@ -162,8 +162,8 @@ public final class CoverageStore {
                 if(unsafe!=null&&unsafe[0]!=0)d=new Directory(low,high);
                 else if(bytes!=null){d=Directory.decode(bytes);if(d.min!=low||d.max!=high)d=null;}
                 if(d==null){
-                    byte[] raw=db.get(key(id));
-                    if(raw!=null&&!migrate)return null;
+                    if(!migrate&&db.contains(key(id)))return null;
+                    byte[] raw=migrate?db.get(key(id)):null;
                     d=new Directory(low,high);
                     if(raw!=null){
                         for(int slot=0;slot<1024;slot++){
@@ -189,6 +189,16 @@ public final class CoverageStore {
         return result;
     }
     private void cacheDirectory(long id,Directory d){directories.put(id,d);while(directories.size()>maxPages*2)directories.remove(directories.keySet().iterator().next());}
+    public synchronized Stamp directoryColumn(int x,int z){
+        long version=-1;int level=0,slot=(x&31)|((z&31)<<5);
+        for(int py=Math.floorDiv(minY,32);py<=Math.floorDiv(maxY-1,32);py++){
+            long id=node(4,x>>5,py,z>>5);Page p=lru.get(id);Directory d=p==null?directories.get(id):pageDirectory(id,p);
+            if(d==null)return new Stamp(0,5);
+            if(version==-1)version=d.versions[slot];else if(version!=d.versions[slot])return new Stamp(0,5);
+            level=Math.max(level,d.levels[slot]);
+        }
+        return new Stamp(Math.max(0,version),level);
+    }
     private Page page(int x,int y,int z){return page(x,y,z,false);}
     private Page page(int x,int y,int z,boolean meshLoad) {
         long id=pageKey(x,y,z);Page p=lru.get(id);if(p!=null)return p;
