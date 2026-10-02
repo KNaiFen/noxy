@@ -14,6 +14,7 @@ import net.minecraftforge.fml.ModLoadingContext;
 
 public final class ClientEvents {
     public static void register() {
+        net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext.get().getModEventBus().addListener((net.minecraftforge.fml.event.lifecycle.FMLClientSetupEvent event)->event.enqueueWork(()->CacheIndexStartup.start(net.minecraft.client.Minecraft.getInstance().gameDirectory.toPath())));
         ModLoadingContext.get().registerExtensionPoint(ConfigScreenHandler.ConfigScreenFactory.class,
                 () -> new ConfigScreenHandler.ConfigScreenFactory((mc, parent) -> new DistantScreen(parent)));
         var bus = MinecraftForge.EVENT_BUS;

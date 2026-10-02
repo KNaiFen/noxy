@@ -32,6 +32,7 @@ class CoverageDirectoryTest {
         cache.restrict(0,0,0,2,11);
         cache.received(0,0,0,11,0,false);
         cache.closeUnconfirmed();
+        var startup=CoverageStore.openDatabase(file.resolveSibling("coverage.bin.rocksdb")).join();while(!CoverageStore.rebuildDirectoriesStep(startup).complete()){}CoverageStore.closeDatabase(file.resolveSibling("coverage.bin.rocksdb"));
         cache=new CoverageStore(file);cache.remote(0,2,256);
         assertEquals(5,cache.directory(0,0,false).column(0).level());
         assertEquals(0,cache.usage().pages());
@@ -47,5 +48,36 @@ class CoverageDirectoryTest {
         for(int i=0;i<3;i++)assertNull(cache.directory(0,0,true));
         assertEquals(new CoverageStore.Stamp(12,3),cache.directory(0,0,true).column(0));
         assertEquals(3,cache.directoryUsage().migrations());assertEquals(0,cache.usage().pages());cache.closeUnconfirmed();
+    }
+    @Test void startupMigrationNeedsNoWorldHeightAndSharesDatabaseWithLiveWorld()throws Exception{
+        Path file=directory.resolve("startup.bin"),dbPath=file.resolveSibling("startup.bin.rocksdb");
+        var cache=new CoverageStore(file);cache.remote(-4,40,256);
+        for(int y=-4;y<40;y++)cache.received(-1,y,-1,12,2,true);
+        cache.received(-2,0,-1,13,0,false);cache.saveAfterWorldClosed();
+        try(var options=new org.rocksdb.Options();var db=org.rocksdb.RocksDB.open(options,dbPath.toString())){
+            for(int py=-1;py<=1;py++)db.delete(java.nio.ByteBuffer.allocate(9).put((byte)4).putLong(CoverageStore.node(4,-1,py,-1)).array());
+        }
+        var database=CoverageStore.openDatabase(dbPath).join();
+        assertFalse(CoverageStore.rebuildDirectoriesStep(database).complete());CoverageStore.closeDatabase(dbPath);
+        database=CoverageStore.openDatabase(dbPath).join();
+        var progress=CoverageStore.rebuildDirectoriesStep(database);while(!progress.complete())progress=CoverageStore.rebuildDirectoriesStep(database);
+        assertEquals(3,progress.pages());assertTrue(CoverageStore.directoriesComplete(database));
+        cache=new CoverageStore(file);cache.remote(-4,40,256);var d=cache.directory(-1,-1,false);
+        assertNotNull(d);assertEquals(new CoverageStore.Stamp(12,2),d.column(1023));assertEquals(5,d.column(1022).level());
+        cache.remote(0,2,256);assertEquals(new CoverageStore.Stamp(12,2),cache.directory(-1,-1,false).column(1023));
+        assertEquals(0,cache.directoryUsage().migrations());assertEquals(0,cache.usage().pages());
+        CoverageStore.closeDatabase(dbPath); // The live world still owns its reference.
+        assertEquals(new CoverageStore.Stamp(12,2),cache.directory(-1,-1,false).column(1023));cache.closeUnconfirmed();
+        database=CoverageStore.openDatabase(dbPath).join();assertEquals(3,CoverageStore.rebuildDirectoriesStep(database).pages());CoverageStore.closeDatabase(dbPath);
+    }
+    @Test void clientStartupFindsServerAndSingleplayerCachesWithoutJoiningAWorld()throws Exception{
+        var paths=java.util.List.of(directory.resolve(".voxy/saves/example/distant-coverage/world.bin"),directory.resolve("saves/local/voxy/distant-coverage/world.bin"));
+        for(Path file:paths){var cache=new CoverageStore(file);cache.remote(0,1,256);cache.received(0,0,0,10,0,false);cache.saveAfterWorldClosed();}
+        CacheIndexStartup.start(directory).get(10,java.util.concurrent.TimeUnit.SECONDS);
+        for(Path file:paths){var path=file.resolveSibling(file.getFileName()+".rocksdb");var db=CoverageStore.openDatabase(path).join();
+            assertTrue(CoverageStore.directoriesComplete(db));CoverageStore.closeDatabase(path);
+        }
+        CacheIndexStartup.start(directory).get(10,java.util.concurrent.TimeUnit.SECONDS);
+        for(Path file:paths){var cache=new CoverageStore(file);cache.remote(0,1,256);assertEquals(new CoverageStore.Stamp(10,0),cache.directory(0,0,false).column(0));cache.closeUnconfirmed();}
     }
 }

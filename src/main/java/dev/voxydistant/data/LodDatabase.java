@@ -26,6 +26,8 @@ public final class LodDatabase implements AutoCloseable {
     private long reportAt, missing;
     private static final byte[] COUNT="cached-columns".getBytes(StandardCharsets.UTF_8);
     private static final byte[] COUNT_PROGRESS="cached-columns-progress".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] INDEX_PROGRESS="lod-directory-progress-v1".getBytes(StandardCharsets.UTF_8);
+    private volatile boolean indexComplete;
     private volatile long cachedColumns=-1;
     private long counted;
     private byte[] countedThrough;
@@ -48,6 +50,7 @@ public final class LodDatabase implements AutoCloseable {
             java.nio.file.Files.createDirectories(path);
             db = RocksDB.open(options, path.toString());
             byte[] count=db.get(COUNT),progress=db.get(COUNT_PROGRESS);
+            byte[] index=db.get(INDEX_PROGRESS);indexComplete=index!=null&&index[0]!=0;
             if(count!=null)cachedColumns=ByteBuffer.wrap(count).getLong();
             else if(progress!=null){var b=ByteBuffer.wrap(progress);counted=b.getLong();countedThrough=new byte[b.remaining()];b.get(countedThrough);}
             else try(var iterator=db.newIterator()){
@@ -67,7 +70,7 @@ public final class LodDatabase implements AutoCloseable {
         try{return db.get(key,new byte[0])!=RocksDB.NOT_FOUND;}
         catch(RocksDBException e){throw new IllegalStateException("LOD key lookup failed",e);}
     }
-    public void put(byte[] key, byte[] value) {
+    public synchronized void put(byte[] key, byte[] value) {
         long started=DebugLog.start();boolean success=false;
         try { db.put(writes, key, value);success=true; } catch (RocksDBException e) { throw new IllegalStateException("LOD write failed", e); }
         finally { diagnostic(1,started,value.length,success,false); }
@@ -93,9 +96,41 @@ public final class LodDatabase implements AutoCloseable {
         }catch(RocksDBException e){throw new IllegalStateException("LOD cache count failed",e);}
     }
     private byte[] countProgress(long count){return ByteBuffer.allocate(8+(countedThrough==null?0:countedThrough.length)).putLong(count).put(countedThrough==null?new byte[0]:countedThrough).array();}
+    public record KeyPage(List<byte[]> keys,boolean exhausted){}
+    public synchronized KeyPage keys(int kind,byte[] after,int limit){
+        var keys=new ArrayList<byte[]>(limit);
+        try(var iterator=db.newIterator()){
+            iterator.seek(after==null?new byte[]{(byte)kind}:after);
+            if(after!=null&&iterator.isValid()&&Arrays.equals(iterator.key(),after))iterator.next();
+            while(iterator.isValid()&&iterator.key()[0]==kind&&keys.size()<limit){keys.add(iterator.key());iterator.next();}
+            iterator.status();return new KeyPage(keys,!iterator.isValid()||iterator.key()[0]!=kind);
+        }catch(RocksDBException e){throw new IllegalStateException("LOD index key scan failed",e);}
+    }
+    public boolean indexComplete(){return indexComplete;}
+    public record IndexProgress(long columns,boolean complete){}
+    /** Startup-only legacy pass. New writes already maintain metadata in their terrain batch. */
+    public synchronized IndexProgress rebuildIndexStep(){
+        byte[] progress=get(INDEX_PROGRESS);
+        if(indexComplete)return new IndexProgress(ByteBuffer.wrap(progress,1,8).getLong(),true);
+        long columns=progress==null?0:ByteBuffer.wrap(progress,1,8).getLong();
+        byte[] after=progress==null?null:Arrays.copyOfRange(progress,9,progress.length);
+        var page=keys(1,after,64);long deadline=System.nanoTime()+2_000_000L;int visited=0;
+        try(var batch=new WriteBatch()){
+            for(byte[] column:page.keys()){
+                byte[] meta=metadataKey(column);if(db.get(meta)==null)batch.put(meta,legacyMetadata(column).encode());
+                after=column;columns++;visited++;if(System.nanoTime()>=deadline)break;
+            }
+            boolean done=page.exhausted()&&visited==page.keys().size();
+            batch.put(INDEX_PROGRESS,ByteBuffer.allocate(9+(after==null?0:after.length)).put((byte)(done?1:0)).putLong(columns).put(after==null?new byte[0]:after).array());
+            if(done&&cachedColumns<0){batch.put(COUNT,ByteBuffer.allocate(8).putLong(columns).array());batch.delete(COUNT_PROGRESS);}
+            db.write(writes,batch);if(done){if(cachedColumns<0)cachedColumns=columns;sync();indexComplete=true;}
+            return new IndexProgress(columns,done);
+        }catch(RocksDBException e){throw new IllegalStateException("LOD startup index migration failed",e);}
+    }
     private void addColumn(WriteBatch batch,byte[] key)throws RocksDBException{
         if(cachedColumns>=0)batch.put(COUNT,ByteBuffer.allocate(8).putLong(cachedColumns+1).array());
         else if(countedThrough!=null&&Arrays.compareUnsigned(key,countedThrough)<=0)batch.put(COUNT_PROGRESS,countProgress(counted+1));
+        if(!indexComplete){byte[] index=db.get(INDEX_PROGRESS);if(index!=null&&index.length>9&&Arrays.compareUnsigned(key,Arrays.copyOfRange(index,9,index.length))<=0){var b=ByteBuffer.wrap(index);b.putLong(1,b.getLong(1)+1);batch.put(INDEX_PROGRESS,index);}}
     }
     private void columnAdded(byte[] key){if(cachedColumns>=0)cachedColumns++;else if(countedThrough!=null&&Arrays.compareUnsigned(key,countedThrough)<=0)counted++;}
     public CacheStats cacheStats() {
@@ -143,6 +178,7 @@ public final class LodDatabase implements AutoCloseable {
     }
     /** Persist migration progress; a region takes at most 64 legacy header reads per turn. */
     public synchronized boolean prepareRegion(String dimension,int rx,int rz){
+        if(indexComplete)return true;
         byte[] progressKey=regionKey(dimension,rx,rz,6),progress=get(progressKey);int start=progress==null?0:ByteBuffer.wrap(progress).getInt();
         if(start==1024)return true;
         int end=Math.min(1024,start+64);
@@ -165,9 +201,10 @@ public final class LodDatabase implements AutoCloseable {
             }
             iterator.status();
         }catch(RocksDBException e){throw new IllegalStateException("LOD directory read failed",e);}
+        for(int i=0;i<result.length;i++)if(result[i]==null)result[i]=new Metadata(0,0,0);
         return result;
     }
-    public void batch(Map<byte[], byte[]> entries) {
+    public synchronized void batch(Map<byte[], byte[]> entries) {
         long started=DebugLog.start(),size=0;boolean success=false;
         try (var batch = new WriteBatch()) {
             for (var e : entries.entrySet()) {batch.put(e.getKey(), e.getValue());if(started!=0)size+=e.getValue().length;}

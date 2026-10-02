@@ -56,4 +56,32 @@ class LodDatabaseDirectoryTest {
             assertEquals(0,region[32].mask());
         }
     }
+    @Test void startupIndexResumesAndSkipsTerrainAfterCompletion()throws Exception{
+        RocksDB.loadLibrary();
+        try(var options=new Options().setCreateIfMissing(true);var db=RocksDB.open(options,directory.toString())){
+            for(int i=0;i<130;i++)db.put(key(i,0),body(7));
+            db.put(LodDatabase.key("minecraft:the_nether",-1L,1),body(9));
+        }
+        try(var db=new LodDatabase(directory,8L<<20)){
+            assertFalse(db.rebuildIndexStep().complete());
+            db.storeColumn(key(0,-1),body(8),8,31); // A new key after the current cursor.
+            db.storeColumn(LodDatabase.key("minecraft:aaa",0,1),body(6),6,31); // Behind the persisted cursor.
+            db.storeColumn(key(0,0),body(8),8,31);
+        }
+        try(var db=new LodDatabase(directory,8L<<20)){
+            var step=db.rebuildIndexStep();while(!step.complete())step=db.rebuildIndexStep();
+            assertEquals(133,step.columns());assertEquals(133,db.cacheStats().columns());
+            assertTrue(db.indexComplete());assertTrue(db.prepareRegion("minecraft:overworld",0,0));
+            assertEquals(8,db.region("minecraft:overworld",0,0)[0].version());
+            assertEquals(0,db.region("minecraft:overworld",100,100)[0].mask());
+            assertEquals(9,db.metadata(LodDatabase.key("minecraft:the_nether",-1L,1)).version());
+            db.put(key(0,0),new byte[]{99}); // Completed startup must not parse terrain again.
+        }
+        try(var db=new LodDatabase(directory,8L<<20)){
+            assertTrue(db.indexComplete());assertEquals(133,db.rebuildIndexStep().columns());
+            assertEquals(8,db.metadata(key(0,0)).version());
+            db.storeColumn(key(-1,-1),body(10),10,31);assertEquals(134,db.cacheStats().columns());
+            assertEquals(10,db.region("minecraft:overworld",-1,-1)[1023].version());
+        }
+    }
 }

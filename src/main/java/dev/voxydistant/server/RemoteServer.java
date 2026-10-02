@@ -94,6 +94,9 @@ public final class RemoteServer {
     private volatile boolean maintenancePaused;
     private volatile Thread maintenanceScanner;
     private volatile boolean importStorageFailed;
+    private LodDatabase indexingDatabase;
+    private boolean indexReading,indexFailed;
+    private long indexStarted,indexReported;
     private boolean exclusiveImport() { return maintenance!=null && maintenance.type==MaintenanceType.IMPORT; }
     private record ImportDimension(RegionNbtImporter parser, int minSection, int sections) {}
 
@@ -375,6 +378,7 @@ public final class RemoteServer {
         }
         if(ticks==1 || ticks%40==0) for(Session s:players.values()) if(s.radius==0) hello(s.player);
         var limits=DistantConfig.serverLimits();
+        rebuildStartupIndex();
         if(workers.getCorePoolSize()!=limits.threads()) {
             workers.setMaximumPoolSize(Math.max(limits.threads(),workers.getCorePoolSize())); workers.setCorePoolSize(limits.threads()); workers.setMaximumPoolSize(limits.threads());
         }
@@ -457,6 +461,27 @@ public final class RemoteServer {
             }
             DebugLog.timings("SERVER");
         }
+    }
+    private void rebuildStartupIndex(){
+        if(configChange!=null||exclusiveImport()||importStorageFailed)return;
+        var db=database;
+        if(indexingDatabase!=db){
+            indexingDatabase=db;indexFailed=false;indexStarted=indexReported=System.nanoTime();
+            if(db.indexComplete())LOG.info("Voxy Distant 服务端索引已就绪，跳过重建");
+            else LOG.info("Voxy Distant 服务端开始补建旧 LOD 索引，无需玩家进入（支持断点续建）");
+        }
+        if(db.indexComplete()||indexReading||indexFailed||workers.getQueue().size()>DistantConfig.SERVER_QUEUE.get()||dirtyWrites.get()>8)return;
+        indexReading=true;boolean idle=players.isEmpty();
+        workers.execute(()->{
+            try{
+                long deadline=System.nanoTime()+(idle?10_000_000L:2_000_000L);LodDatabase.IndexProgress progress;
+                do{progress=db.rebuildIndexStep();}while(!progress.complete()&&!stopping&&System.nanoTime()<deadline);
+                long now=System.nanoTime();
+                if(progress.complete())LOG.info("Voxy Distant 服务端旧 LOD 索引建立完成：检查 {} 列，缓存列数 {}，耗时 {} ms；后续启动跳过重建",progress.columns(),db.cacheStats().columns(),(now-indexStarted)/1_000_000);
+                else if(now-indexReported>=TimeUnit.SECONDS.toNanos(5)){indexReported=now;db.sync();LOG.info("Voxy Distant 服务端旧 LOD 索引进度：已检查 {} 列，耗时 {} s",progress.columns(),(now-indexStarted)/1_000_000_000);}
+                server.execute(()->indexReading=false);
+            }catch(RuntimeException e){server.execute(()->{indexReading=false;indexFailed=true;fail(new IllegalStateException("服务端启动索引失败；已提交进度保留，下次启动或重开缓存后继续",e));});}
+        });
     }
     private void complete(Runnable action){server.execute(()->{if(!stopping){action.run();schedule(DistantConfig.serverLimits());}});}
     private boolean foregroundPending(){for(Session session:players.values())if(!session.pending.isEmpty())return true;return false;}
@@ -1254,22 +1279,9 @@ public final class RemoteServer {
         self.workers.execute(()->{
             try {
                 var db=self.database;
-                self.startCacheCount(db);
                 var stats=db.cacheStats();
                 self.server.execute(()->{if(!self.stopping&&player.connection.isAcceptingMessages())Protocol.send(player,new Protocol.CacheStats(stats.bytes(),stats.columns()));});
             }catch(RuntimeException ex){self.server.execute(()->self.fail(ex));}
-        });
-    }
-    private final java.util.concurrent.atomic.AtomicBoolean countingCache=new java.util.concurrent.atomic.AtomicBoolean();
-    private void startCacheCount(LodDatabase db){
-        if(!countingCache.compareAndSet(false,true))return;
-        countCacheStep(db);
-    }
-    private void countCacheStep(LodDatabase db){
-        workers.execute(()->{
-            if(stopping||database!=db||configChange!=null){countingCache.set(false);return;}
-            try{boolean done=db.countCachedColumnsStep();server.execute(()->{if(done||stopping||database!=db)countingCache.set(false);else countCacheStep(db);});}
-            catch(RuntimeException ex){countingCache.set(false);server.execute(()->fail(ex));}
         });
     }
     private void applyConfiguration(ServerSettings.Snapshot next,java.util.function.BooleanSupplier allowed,java.util.function.Consumer<String> done) {

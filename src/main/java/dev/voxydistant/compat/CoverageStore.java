@@ -16,6 +16,21 @@ public final class CoverageStore {
     private static final int REFRESH_PENDING=16;
     private final Path path;
     private final CompletableFuture<LodDatabase> database;
+    private static final Map<Path,DatabaseHandle> databases=new HashMap<>();
+    private static final class DatabaseHandle {
+        final CompletableFuture<LodDatabase> database;int references=1;
+        DatabaseHandle(Path path){database=CompletableFuture.supplyAsync(()->{var db=new LodDatabase(path,8L<<20);migrate(path.resolveSibling(path.getFileName().toString().replaceFirst("\\.rocksdb$","")),db);return db;});}
+    }
+    public static synchronized CompletableFuture<LodDatabase> openDatabase(Path path){
+        path=path.toAbsolutePath().normalize();var handle=databases.get(path);
+        if(handle==null){handle=new DatabaseHandle(path);databases.put(path,handle);}else handle.references++;
+        return handle.database;
+    }
+    public static synchronized void closeDatabase(Path path){
+        path=path.toAbsolutePath().normalize();var handle=databases.get(path);
+        if(--handle.references==0){databases.remove(path);handle.database.join().close();}
+    }
+    private static final byte[] DIRECTORY_PROGRESS="coverage-directory-progress-v2".getBytes(java.nio.charset.StandardCharsets.UTF_8);
     private volatile it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<Page> pages = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();
     private final LinkedHashMap<Long, Page> lru = new LinkedHashMap<>(16,.75f,true);
     private final LinkedHashMap<Long,Directory> directories=new LinkedHashMap<>(16,.75f,true);
@@ -23,13 +38,45 @@ public final class CoverageStore {
     public record DirectoryUsage(long reads,long migrations,int cached){}
     public synchronized DirectoryUsage directoryUsage(){return new DirectoryUsage(directoryReads,directoryMigrations,directories.size());}
     public static final class Directory {
+        private static final int FORMAT=0x56444432;
         public final long[] versions=new long[1024];
         public final byte[] levels=new byte[1024];
         final int min,max;
+        private byte[][] runs;
         Directory(int min,int max){this.min=min;this.max=max;Arrays.fill(levels,(byte)5);}
         public Stamp column(int slot){return new Stamp(versions[slot],levels[slot]);}
-        byte[] encode(){var b=ByteBuffer.allocate(8+1024*9).putInt(min).putInt(max);for(int i=0;i<1024;i++)b.putLong(versions[i]).put(levels[i]);return b.array();}
-        static Directory decode(byte[] bytes){var b=ByteBuffer.wrap(bytes);var d=new Directory(b.getInt(),b.getInt());for(int i=0;i<1024;i++){d.versions[i]=b.getLong();d.levels[i]=b.get();}return d;}
+        byte[] encode(){
+            if(runs==null){var b=ByteBuffer.allocate(8+1024*9).putInt(min).putInt(max);for(int i=0;i<1024;i++)b.putLong(versions[i]).put(levels[i]);return b.array();}
+            int size=12;for(byte[] run:runs)size+=run.length;var b=ByteBuffer.allocate(size).putInt(FORMAT).putInt(min).putInt(max);for(byte[] run:runs)b.put(run);return b.array();
+        }
+        static Directory decode(byte[] bytes){
+            var b=ByteBuffer.wrap(bytes);int min=b.getInt();
+            if(min!=FORMAT){var d=new Directory(min,b.getInt());for(int i=0;i<1024;i++){d.versions[i]=b.getLong();d.levels[i]=b.get();}return d;}
+            var d=new Directory(b.getInt(),b.getInt());d.runs=new byte[1024][];
+            for(int i=0;i<1024;i++){int count=b.get()&255;byte[] run=new byte[1+count*10];run[0]=(byte)count;b.get(run,1,run.length-1);d.runs[i]=run;}
+            return d;
+        }
+        Directory slice(int low,int high){
+            if(runs==null)return min==low&&max==high?this:null;
+            var d=new Directory(low,high);
+            for(int slot=0;slot<1024;slot++){
+                var b=ByteBuffer.wrap(runs[slot]);int count=b.get()&255,start=min,level=0;long version=-1;
+                for(int n=0;n<count;n++){int end=min+(b.get()&255),value=b.get()&255;long v=b.getLong();if(start<high&&end>low){if(version==-1)version=v;else if(version!=v){version=0;level=5;break;}level=Math.max(level,value);}start=end;}
+                d.versions[slot]=Math.max(0,version);d.levels[slot]=(byte)level;
+            }
+            return d;
+        }
+        static Directory fromCoverage(byte[] raw,int min){
+            var d=new Directory(min,min+32);d.runs=new byte[1024][];var b=ByteBuffer.wrap(raw);
+            for(int slot=0;slot<1024;slot++){
+                var run=ByteBuffer.allocate(1+32*10);run.put((byte)0);int count=0,previous=-1;long version=-1;
+                for(int y=0;y<32;y++){int at=1+((y<<10)|slot)*9,value=raw[at]&255,level=(value&REFRESH_PENDING)!=0?5:value&7;long v=b.getLong(at+1);
+                    if(level!=previous||v!=version){run.put((byte)(y+1)).put((byte)level).putLong(v);count++;previous=level;version=v;}else run.put(1+(count-1)*10,(byte)(y+1));
+                }
+                run.put(0,(byte)count);d.runs[slot]=Arrays.copyOf(run.array(),run.position());
+            }
+            return d;
+        }
     }
     private final Set<Long> unsafePages = new HashSet<>();
     private final Set<Long> changedPages = new HashSet<>();
@@ -62,7 +109,7 @@ public final class CoverageStore {
     private record RenderMask(long generation,byte children){}
     public CoverageStore(Path path) {
         this.path=path;
-        database=CompletableFuture.supplyAsync(()->{var db=new LodDatabase(path.resolveSibling(path.getFileName()+".rocksdb"),8L<<20);migrate(db);return db;});
+        database=openDatabase(path.resolveSibling(path.getFileName()+".rocksdb"));
     }
     public synchronized void remote(int min,int max,int memoryMiB){if(minY!=min||maxY!=max){directories.clear();for(var p:lru.values())p.directory=null;}minY=min;maxY=max;maxPages=Math.max(8,(int)(memoryMiB*1048576L/400000));remote=true;}
     public synchronized void active(int x,int z,int r){centerX=x;centerZ=z;radius=r;}
@@ -173,18 +220,14 @@ public final class CoverageStore {
             if(d==null){
                 directoryReads++;var db=database.join();byte[] unsafe=db.get(guard(id)),bytes=db.get(directoryKey(id));
                 if(unsafe!=null&&unsafe[0]!=0)d=new Directory(low,high);
-                else if(bytes!=null){d=Directory.decode(bytes);if(d.min!=low||d.max!=high)d=null;}
+                else if(bytes!=null)d=Directory.decode(bytes).slice(low,high);
                 if(d==null){
                     if(!migrate&&db.contains(key(id)))return null;
                     byte[] raw=migrate?db.get(key(id)):null;
                     d=new Directory(low,high);
                     if(raw!=null){
-                        for(int slot=0;slot<1024;slot++){
-                            long version=-1;int level=0;
-                            for(int y=low;y<high;y++){int at=1+(((y&31)<<10)|slot)*9,value=raw[at]&255;long v=ByteBuffer.wrap(raw,at+1,8).getLong();if(version==-1)version=v;else if(version!=v){level=5;version=0;break;}level=Math.max(level,(value&REFRESH_PENDING)!=0?5:value&7);}
-                            d.versions[slot]=Math.max(0,version);d.levels[slot]=(byte)level;
-                        }
-                        db.put(directoryKey(id),d.encode());directoryMigrations++;
+                        var full=Directory.fromCoverage(raw,py*32);d=full.slice(low,high);
+                        db.put(directoryKey(id),full.encode());directoryMigrations++;
                         cacheDirectory(id,d);
                         return null; // Bound legacy reconstruction to one vertical page per task.
                     }
@@ -329,7 +372,7 @@ public final class CoverageStore {
         long started=DebugLog.start();
         try{flushVoxels.run();}finally{DebugLog.end(DebugLog.Metric.CLIENT_STORAGE_FLUSH,started);}
         var batch=new HashMap<byte[],byte[]>();var db=database.join();
-        for(long id:ready){Page p=lru.get(id);Directory d=pageDirectory(id,p);batch.put(key(id),encode(p));batch.put(directoryKey(id),d.encode());batch.put(guard(id),new byte[]{0});cacheDirectory(id,d);if(batch.size()>=32){db.batch(batch);batch.clear();}}
+        for(long id:ready){Page p=lru.get(id);Directory d=pageDirectory(id,p);byte[] raw=encode(p);batch.put(key(id),raw);batch.put(directoryKey(id),Directory.fromCoverage(raw,ny(id)*32).encode());batch.put(guard(id),new byte[]{0});cacheDirectory(id,d);if(batch.size()>=32){db.batch(batch);batch.clear();}}
         if(!batch.isEmpty())db.batch(batch);db.sync();
         for(long id:ready){changedPages.remove(id);unsafePages.remove(id);pendingSaves.remove(id);}
         trimExcess();
@@ -355,9 +398,25 @@ public final class CoverageStore {
     public synchronized boolean fullGroup(long k){int x=nx(k)*4,y=ny(k)*4,z=nz(k)*4;Page p=page(x,y,z);return p.counts[0].get(counter(x,y,z,1))==64;}
     public synchronized boolean isCoarse(long k){return page(nx(k)*4,ny(k)*4,nz(k)*4).restricted;}
     private static byte[] encode(Page p){var b=ByteBuffer.allocate(1+32768*9).put((byte)(p.restricted?1:0));for(int i=0;i<32768;i++)b.put(p.minimum[i]).putLong(p.versions[i]);return b.array();}
-    public synchronized void saveAfterWorldClosed(){var db=database.join();var batch=new HashMap<byte[],byte[]>();for(var e:lru.entrySet()){var pending=pendingSaves.get(e.getKey());if(pending!=null&&!pending.isEmpty()){if(DebugLog.enabled())for(long node:pending)DebugLog.log("CLIENT close_unconfirmed page={} node={} current_generation={}",e.getKey(),node,meshGeneration(node));continue;}batch.put(key(e.getKey()),encode(e.getValue()));batch.put(directoryKey(e.getKey()),pageDirectory(e.getKey(),e.getValue()).encode());batch.put(guard(e.getKey()),new byte[]{0});if(batch.size()>=32){db.batch(batch);batch.clear();}}if(!batch.isEmpty())db.batch(batch);db.close();pages=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();lru.clear();directories.clear();}
-    public synchronized void closeUnconfirmed(){database.join().close();pages=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();lru.clear();directories.clear();}
-    private void migrate(LodDatabase db) {
+    public synchronized void saveAfterWorldClosed(){var db=database.join();var batch=new HashMap<byte[],byte[]>();for(var e:lru.entrySet()){var pending=pendingSaves.get(e.getKey());if(pending!=null&&!pending.isEmpty()){if(DebugLog.enabled())for(long node:pending)DebugLog.log("CLIENT close_unconfirmed page={} node={} current_generation={}",e.getKey(),node,meshGeneration(node));continue;}byte[] raw=encode(e.getValue());batch.put(key(e.getKey()),raw);batch.put(directoryKey(e.getKey()),Directory.fromCoverage(raw,ny(e.getKey())*32).encode());batch.put(guard(e.getKey()),new byte[]{0});if(batch.size()>=32){db.batch(batch);batch.clear();}}if(!batch.isEmpty())db.batch(batch);closeDatabase(path.resolveSibling(path.getFileName()+".rocksdb"));pages=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();lru.clear();directories.clear();}
+    public synchronized void closeUnconfirmed(){closeDatabase(path.resolveSibling(path.getFileName()+".rocksdb"));pages=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();lru.clear();directories.clear();}
+    public record DirectoryProgress(long pages,boolean complete){}
+    public static boolean directoriesComplete(LodDatabase db){byte[] progress=db.get(DIRECTORY_PROGRESS);return progress!=null&&progress[0]!=0;}
+    public static DirectoryProgress rebuildDirectoriesStep(LodDatabase db){
+        synchronized(db){
+            byte[] progress=db.get(DIRECTORY_PROGRESS);long pages=progress==null?0:ByteBuffer.wrap(progress,1,8).getLong();
+            if(progress!=null&&progress[0]!=0)return new DirectoryProgress(pages,true);
+            byte[] after=progress==null?null:Arrays.copyOfRange(progress,9,progress.length);var next=db.keys(1,after,1);var batch=new HashMap<byte[],byte[]>();
+            for(byte[] k:next.keys()){
+                long id=ByteBuffer.wrap(k,1,8).getLong();byte[] existing=db.get(directoryKey(id));
+                if(existing==null||ByteBuffer.wrap(existing).getInt()!=Directory.FORMAT)batch.put(directoryKey(id),Directory.fromCoverage(db.get(k),ny(id)*32).encode());
+                after=k;pages++;
+            }
+            batch.put(DIRECTORY_PROGRESS,ByteBuffer.allocate(9+(after==null?0:after.length)).put((byte)(next.exhausted()?1:0)).putLong(pages).put(after==null?new byte[0]:after).array());db.batch(batch);
+            if(next.exhausted())db.sync();return new DirectoryProgress(pages,next.exhausted());
+        }
+    }
+    private static void migrate(Path path,LodDatabase db) {
         if(!Files.exists(path)||db.get(new byte[]{2})!=null)return;
         try(var in=new DataInputStream(new BufferedInputStream(Files.newInputStream(path)))) {
             if(in.readInt()!=0x56444331)throw new IOException("Unknown coverage format");
