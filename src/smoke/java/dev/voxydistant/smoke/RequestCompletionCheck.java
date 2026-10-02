@@ -26,6 +26,7 @@ public final class RequestCompletionCheck {
         var greeting=RemoteClient.greeting();var hello=new Protocol.Hello(greeting.world(),greeting.dimension(),64,mc.level.getMinSection(),mc.level.getMaxSection(),List.of("4:0","64:2"));
         Object session=constructor.newInstance(engine,mc.level,hello);int epoch=900000;
         field(type,"epoch").setInt(session,epoch);field(type,"radius").setInt(session,64);field(type,"x").setInt(session,0);
+        field(type,"shape").set(session,dev.voxydistant.movement.RequestShape.circle(0,0,64));
         field(type,"generation").setInt(session,2);sessionField.set(null,session);paused.setBoolean(null,true);
         dev.voxydistant.config.DistantConfig.RECEIVE.set(true);
         var worker=(ThreadPoolExecutor)field(type,"worker").get(session);

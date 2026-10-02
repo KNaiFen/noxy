@@ -206,20 +206,22 @@ public final class RemoteClient {
                 ?coverage.limitRadius(requested,x,z):s.radius;
         s.requestedRadius=requested;
         if(radius<requested&&s.ticks%100==0)mc.gui.setOverlayMessage(net.minecraft.network.chat.Component.literal("索引预算不足：实际远景 "+radius+" / "+requested+" 区块；详情见 VD 设置"),false);
-        if(s.movementRevision!=motion.revision()||s.x!=x||s.z!=z)radius=Math.min(radius,coverage.limitShape(motion.shape(radius,s.hello.radius()),Math.min(radius,VoxyBridge.radiusChunks())));
-        if(s.x!=x||s.z!=z||s.radius!=radius||s.view!=view||s.movementRevision!=motion.revision()) {
+        if(s.movementRevision!=motion.revision()||radius!=s.radius||indexChanged)radius=Math.min(radius,coverage.limitShape(motion.shape(radius,s.hello.radius()),Math.min(radius,VoxyBridge.radiusChunks())));
+        boolean teleportMove=s.x!=Integer.MIN_VALUE&&(Math.abs((long)x-s.x)>32||Math.abs((long)z-s.z)>32);
+        if(s.shape==null||teleportMove||s.radius!=radius||s.view!=view||s.movementRevision!=motion.revision()) {
             if(DebugLog.enabled())DebugLog.log("CLIENT move epoch={} from_x={} from_z={} x={} z={} generation={} radius={} view={}",s.epoch,s.x,s.z,x,z,s.generation+1,radius,view);
             boolean teleport=s.x!=Integer.MIN_VALUE&&(Math.abs((long)x-s.x)>32||Math.abs((long)z-s.z)>32);
             s.x=x;s.z=z;s.radius=radius;s.view=view;s.generation++;s.preempted=0;
             if(teleport){s.epoch=++sequence;s.pending.clear();s.checked.clear();s.invalid.clear();s.retries.clear();synchronized(s.assemblies){for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();s.discardedBatches.clear();}}
             if(teleport){s.discovery.reset();s.regionQueries.clear();}
-            s.movementRevision=motion.revision();s.shape=motion.shape(radius,s.hello.radius());s.discovery.move(s.shape);
+            s.movementRevision=motion.revision();s.shape=motion.shape(radius,s.hello.radius()).precision(requested==0?1:(double)radius/requested);s.discovery.move(s.shape);
             var regionCancels=new ArrayList<Long>();for(var it=s.regionQueries.entrySet().iterator();it.hasNext();){var entry=it.next();var r=entry.getValue().region();if(s.discovery.regions.get(RegionDiscovery.key(r.x,r.z))!=r){regionCancels.add(entry.getKey());it.remove();}}
             if(!regionCancels.isEmpty())Protocol.CHANNEL.sendToServer(new Protocol.RegionCancel(s.epoch,List.copyOf(regionCancels)));
+            if(DebugLog.verbose()&&!regionCancels.isEmpty())DebugLog.log("CLIENT region_cancel count={}",regionCancels.size());
             var cancels=new ArrayList<Protocol.Cancel>();for(var entry:s.pending.entrySet()){var request=entry.getValue();long p=entry.getKey();if(!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)))synchronized(request){if(!request.receiving&&!request.applying&&s.pending.remove(p,request))cancels.add(new Protocol.Cancel(ChunkPos.getX(p),ChunkPos.getZ(p),request.id()));}}
             for(int i=0;i<cancels.size();i+=16)send(s,List.of(),cancels.subList(i,Math.min(i+16,cancels.size())));
             s.checked.keySet().removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
-            s.versions.keySet().removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
+            s.versions.keySet().removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p))&&!s.pending.containsKey(p));
             s.invalid.removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
             s.retries.moved(p->inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)),p->desired(s,p),p->urgent(s,p),System.nanoTime());
             Minecraft.getInstance().execute(()->send(s,List.of()));
@@ -401,8 +403,8 @@ public final class RemoteClient {
         retry(s,victim,"preempted");s.preempted++;
         return new Protocol.Cancel(ChunkPos.getX(victim),ChunkPos.getZ(victim),removed.id());
     }
-    private static boolean inRange(Session s,int x,int z){return s.shape!=null&&s.shape.contains(x,z);}
-    private static int desired(Session s,long p){return s.shape==null?s.bands.select(ChunkPos.getX(p),ChunkPos.getZ(p),s.x,s.z):s.shape.desired(s.bands,ChunkPos.getX(p),ChunkPos.getZ(p));}
+    private static boolean inRange(Session s,int x,int z){var player=Minecraft.getInstance().player.chunkPosition();long dx=(long)x-player.x,dz=(long)z-player.z;return s.shape!=null&&s.shape.contains(x,z)&&dx*dx+dz*dz<=(long)s.hello.radius()*s.hello.radius();}
+    private static int desired(Session s,long p){var player=Minecraft.getInstance().player.chunkPosition();int x=ChunkPos.getX(p),z=ChunkPos.getZ(p),allowed=s.bands.select(x,z,player.x,player.z);return s.shape==null?allowed:Math.max(s.shape.desired(s.bands,x,z),allowed);}
     private static boolean urgent(Session s,long p){
         int target=desired(s,p),known=s.checked.getOrDefault(p,5);return target==s.bands.levels()[0]||known<5&&known>target;
     }
@@ -417,7 +419,6 @@ public final class RemoteClient {
         Minecraft.getInstance().execute(()->{
             if(session!=s||s.epoch!=epoch||!currentRequest(s,p,requestId))return;
             var requested=s.pending.remove(p);
-            var player=Minecraft.getInstance().player.chunkPosition();
             int target=desired(s,p);
             long dirtyVersion=s.versions.getOrDefault(p,0L),latest=Math.max(responseVersion,dirtyVersion);
             boolean current=stamp.version()>=latest;
@@ -460,9 +461,10 @@ public final class RemoteClient {
     }
     private static void send(Session s,List<Protocol.Want> wants){send(s,wants,List.of());}
     private static void send(Session s,List<Protocol.Want> wants,List<Protocol.Cancel> cancels){if(session==s&&!s.closed&&!maintenancePaused){
-        if(DebugLog.verbose())DebugLog.log("CLIENT request world={} dimension={} epoch={} wants={} pending={} credit={} bandwidth_kib={}",s.hello.world(),s.hello.dimension(),s.epoch,wants.size(),s.pending.size(),s.networkCapacity,DistantConfig.DOWNLOAD_KBPS.get());
-        int envelope=s.shape==null?s.radius:Math.min(s.hello.radius(),(int)Math.ceil(Math.hypot(s.shape.centerX()-s.x,s.shape.centerZ()-s.z)+s.radius*(1+.5*s.shape.amount())));
-        for(var entry:s.pending.entrySet())if(entry.getValue().receiving){long p=entry.getKey();envelope=Math.min(s.hello.radius(),Math.max(envelope,(int)Math.ceil(Math.sqrt((double)(ChunkPos.getX(p)-s.x)*(ChunkPos.getX(p)-s.x)+(double)(ChunkPos.getZ(p)-s.z)*(ChunkPos.getZ(p)-s.z)))));}
+        if(DebugLog.verbose())DebugLog.log("CLIENT request world={} dimension={} epoch={} wants={} cancels={} pending={} credit={} bandwidth_kib={}",s.hello.world(),s.hello.dimension(),s.epoch,wants.size(),cancels.size(),s.pending.size(),s.networkCapacity,DistantConfig.DOWNLOAD_KBPS.get());
+        var player=Minecraft.getInstance().player.chunkPosition();
+        int envelope=s.shape==null||s.radius==0?s.radius:Math.min(s.hello.radius(),(int)Math.ceil(Math.hypot(s.shape.centerX()-player.x,s.shape.centerZ()-player.z)+s.radius*(1+.5*s.shape.amount())));
+        if(s.radius>0)for(var entry:s.pending.entrySet())if(entry.getValue().receiving){long p=entry.getKey();envelope=Math.min(s.hello.radius(),Math.max(envelope,(int)Math.ceil(Math.sqrt((double)(ChunkPos.getX(p)-player.x)*(ChunkPos.getX(p)-player.x)+(double)(ChunkPos.getZ(p)-player.z)*(ChunkPos.getZ(p)-player.z)))));}
         Protocol.CHANNEL.sendToServer(new Protocol.Requests(s.epoch,envelope,s.view,DistantConfig.DOWNLOAD_KBPS.get(),s.networkCapacity,wants,cancels,s.shape));
     }}
     private static long reserve(Session s,Protocol.Fragment f){return Protocol.reservation(f.totalLength(),f.rawLength(),f.level(),s.hello.maxY()-s.hello.minY());}

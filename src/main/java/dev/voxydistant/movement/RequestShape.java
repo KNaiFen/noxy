@@ -4,15 +4,23 @@ import dev.voxydistant.config.DistanceBands;
 
 /** Horizontal request footprint, in chunk coordinates. Rendering never uses this shape. */
 public record RequestShape(int playerX,int playerZ,double centerX,double centerZ,double directionX,double directionZ,
-                           double amount,int radius,int limit) {
+                           double amount,int radius,int limit,double precisionScale) {
+    public RequestShape(int playerX,int playerZ,double centerX,double centerZ,double directionX,double directionZ,double amount,int radius,int limit){this(playerX,playerZ,centerX,centerZ,directionX,directionZ,amount,radius,limit,1);}
     public double score(double x,double z){
         double dx=x-centerX,dz=z-centerZ,u=dx*directionX+dz*directionZ,w=-dx*directionZ+dz*directionX;
         double side=1-.5*amount,front=u>0?1+.5*amount:side;
         return u*u/(front*front)+w*w/(side*side);
     }
     public double actualDistance(double x,double z){double dx=x-playerX,dz=z-playerZ;return dx*dx+dz*dz;}
+    public int compare(int x,int z,int otherX,int otherZ){
+        int order=Double.compare(score(x,z),score(otherX,otherZ));
+        if(order==0)order=Double.compare(actualDistance(x,z),actualDistance(otherX,otherZ));
+        if(order==0)order=Integer.compare(x,otherX);
+        return order==0?Integer.compare(z,otherZ):order;
+    }
     public boolean contains(int x,int z){return radius>0&&actualDistance(x,z)<=(double)limit*limit&&score(x,z)<=(double)radius*radius;}
-    public RequestShape radius(int value){return new RequestShape(playerX,playerZ,centerX,centerZ,directionX,directionZ,amount,value,limit);}
+    public RequestShape radius(int value){return new RequestShape(playerX,playerZ,centerX,centerZ,directionX,directionZ,amount,value,limit,precisionScale);}
+    public RequestShape precision(double value){return new RequestShape(playerX,playerZ,centerX,centerZ,directionX,directionZ,amount,radius,limit,value);}
     public static RequestShape circle(int x,int z,int radius){return new RequestShape(x,z,x,z,1,0,0,radius,radius);}
 
     /** Convex footprint: corners prove containment, edge minima prove intersection. */
@@ -47,7 +55,7 @@ public record RequestShape(int playerX,int playerZ,double centerX,double centerZ
         int desired=bands.levels()[bands.levels().length-1];
         for(int i=0;i<bands.radii().length;i++){
             int size=1<<(bands.levels()[i]+2),bx=Math.floorDiv(x,size)*size,bz=Math.floorDiv(z,size)*size;
-            if(radius(bands.radii()[i]).relation(bx,bz,bx+size-1,bz+size-1)>=0){desired=bands.levels()[i];break;}
+            if(radius((int)Math.floor(bands.radii()[i]*precisionScale)).relation(bx,bz,bx+size-1,bz+size-1)>=0){desired=bands.levels()[i];break;}
         }
         return Math.max(desired,bands.select(x,z,playerX,playerZ));
     }

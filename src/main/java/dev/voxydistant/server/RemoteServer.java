@@ -626,7 +626,7 @@ public final class RemoteServer {
             if(s.reserved>=s.capacity){s.blocked("credit");continue;}
             var want=s.pending.values().iterator().next();
             // Aging turns eventually win; until then, movement reprioritizes near requests.
-            if(ticks%20!=0){double best=Double.POSITIVE_INFINITY;for(var candidate:s.pending.values()){double distance=priority(s,candidate.x(),candidate.z());if(distance<best){best=distance;want=candidate;}}}
+            if(ticks%20!=0)for(var candidate:s.pending.values())if(compare(s,candidate.x(),candidate.z(),want.x(),want.z())<0)want=candidate;
             s.pending.remove(ChunkPos.asLong(want.x(),want.z()));
             if(!inRange(s,want.x(),want.z())) { reply(s,want,2,"out_of_range");s.latestRequestIds.remove(ChunkPos.asLong(want.x(),want.z()),want.requestId());idle=0;continue; }
             Key key=new Key(s.dimension,want.x(),want.z()); Work existing=work.get(key);
@@ -987,6 +987,7 @@ public final class RemoteServer {
         boolean age=ticks-s.lastReadyAgedTick>=20;
         candidates.sort(Comparator.comparingDouble((Ready r)->priority(s,r.member().x(),r.member().z()))
                 .thenComparingLong(r->distance(center,r.member().x(),r.member().z()))
+                .thenComparingInt(r->r.member().x()).thenComparingInt(r->r.member().z())
                 .thenComparingInt(Ready::tick));
         if(age){var oldest=s.ready.firstEntry().getValue();candidates.remove(oldest);candidates.addFirst(oldest);}
         for(Ready r:candidates){
@@ -1153,14 +1154,19 @@ public final class RemoteServer {
     private int creditLimit(Session s){return Math.min(s.advertisedCapacity,(int)Math.min(Integer.MAX_VALUE,DistantConfig.PLAYER_SEND_MIB.get()*1048576L*4));}
     private static long distance(ChunkPos center,int x,int z){long dx=(long)x-center.x,dz=(long)z-center.z;return dx*dx+dz*dz;}
     private static double priority(Session s,int x,int z){return s.shape==null?distance(s.player.chunkPosition(),x,z):s.shape.score(x,z);}
+    private static int compare(Session s,int x,int z,int otherX,int otherZ){
+        int order=Double.compare(priority(s,x,z),priority(s,otherX,otherZ));var player=s.player.chunkPosition();
+        if(order==0)order=Long.compare(distance(player,x,z),distance(player,otherX,otherZ));
+        if(order==0)order=Integer.compare(x,otherX);return order==0?Integer.compare(z,otherZ):order;
+    }
     private void selectTransfer(Session s){
         Transfer head=s.send.peek();if(head==null||head.offset!=0)return;
-        Transfer chosen=head;boolean age=ticks-s.lastSendAgedTick>=20;double best=Double.POSITIVE_INFINITY;
+        Transfer chosen=head;boolean age=ticks-s.lastSendAgedTick>=20;boolean found=false;int bestX=0,bestZ=0;
         for(var candidate:s.send){
             if(age){if(candidate.created<chosen.created)chosen=candidate;}
-            else {double nearest=Double.POSITIVE_INFINITY;if(candidate.members.isEmpty())nearest=priority(s,candidate.key.x,candidate.key.z);
-                else for(var m:candidate.members)nearest=Math.min(nearest,priority(s,m.x(),m.z()));
-                if(nearest<best){best=nearest;chosen=candidate;}}
+            else {int x=candidate.key.x,z=candidate.key.z;
+                for(var m:candidate.members)if(compare(s,m.x(),m.z(),x,z)<0){x=m.x();z=m.z();}
+                if(!found||compare(s,x,z,bestX,bestZ)<0){found=true;bestX=x;bestZ=z;chosen=candidate;}}
         }
         if(age)s.lastSendAgedTick=ticks;
         if(chosen!=head){s.send.remove(chosen);s.send.addFirst(chosen);}

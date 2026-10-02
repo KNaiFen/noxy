@@ -82,7 +82,7 @@ public final class CoverageStore {
         return low;
     }
     public synchronized int limitShape(dev.voxydistant.movement.RequestShape shape,int renderRadius){
-        int vertical=Math.floorDiv(maxY-1,32)-Math.floorDiv(minY,32)+1,available=Math.max(1,maxPages-Math.max(16,maxPages/20));
+        int available=Math.max(1,maxPages-Math.max(16,maxPages/20));
         int low=0,high=shape.radius();
         while(low<high){int mid=(low+high+1)/2;var footprint=shape.radius(mid);var ids=new HashSet<Long>();
             int reach=Math.max(renderRadius,(int)Math.ceil(Math.hypot(shape.centerX()-shape.playerX(),shape.centerZ()-shape.playerZ())+mid*(1+.5*shape.amount())));

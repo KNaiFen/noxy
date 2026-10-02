@@ -24,10 +24,10 @@ import java.util.concurrent.locks.LockSupport;
 public final class GenerationController {
     private static final Logger LOG = LogUtils.getLogger();
     private static final TicketType<ChunkPos> TICKET = TicketType.create("voxy_distant", Comparator.comparingLong(ChunkPos::toLong));
-    private record Target(MinecraftServer server, ResourceKey<Level> dimension, int x, int z, int view, int radius, boolean paused) {}
-    public record Status(int generating, int converting, long completed, double perSecond, long bytes, String reason, String failure) {}
+    private record Target(MinecraftServer server, ResourceKey<Level> dimension, int x, int z, int view, int radius, boolean paused,dev.voxydistant.movement.MovementPrediction.Snapshot motion) {}
+    public record Status(int generating, int converting, long completed, double perSecond, long bytes, String reason, String failure,long checks,long submitted,long cancelled) {}
     private static volatile Target target;
-    private static volatile Status status = new Status(0, 0, 0, 0, 0, "等待单人世界", "");
+    private static volatile Status status = new Status(0, 0, 0, 0, 0, "等待单人世界", "",0,0,0);
     private static volatile boolean stopping;
     private static WorldEngine offeredEngine;
     private static ResourceKey<Level> offeredDimension;
@@ -52,10 +52,13 @@ public final class GenerationController {
             if (offeredEngine == null) offeredEngine = VoxyBridge.acquire(mc.level);
             offeredDimension = mc.level.dimension();
         }
+        var previous=target;
         target = new Target(server, mc.level.dimension(), mc.player.chunkPosition().x, mc.player.chunkPosition().z,
                 Math.max(mc.options.renderDistance().get(), server.getPlayerList().getViewDistance()),
                 Math.min(DistantConfig.RADIUS.get(), VoxyBridge.radiusChunks()),
-                mc.isPaused() || mc.screen != null && mc.screen.isPauseScreen());
+                mc.isPaused() || mc.screen != null && mc.screen.isPauseScreen(),dev.voxydistant.movement.MovementPrediction.CLIENT.snapshot());
+        // IntegratedServer skips Forge tick events while paused, but still drains its task queue.
+        if(target.paused()&&(previous==null||!previous.paused()||status.generating()>0||status.converting()>0))server.execute(()->serverTick(server));
     }
 
     public static synchronized void serverTick(MinecraftServer server) {
@@ -113,19 +116,18 @@ public final class GenerationController {
         private final Map<Long, Pending> generating = new LinkedHashMap<>();
         private final Map<Long, Conversion> converting = new HashMap<>();
         private final Set<Long> failed = new HashSet<>();
-        private final ArrayDeque<ChunkPos> candidates = new ArrayDeque<>();
+        private final LocalDiscovery discovery=new LocalDiscovery();
         private final ConcurrentLinkedQueue<Conversion> finished = new ConcurrentLinkedQueue<>();
         private final AtomicLong memory = new AtomicLong();
         private final ThreadPoolExecutor workers;
         private final long started = System.nanoTime();
-        private long completed, lastSubmissionTick = System.nanoTime();
+        private long completed,submitted,cancelled,ticks, lastSubmissionTick = System.nanoTime();
         private double submissionTokens;
         private int centerX = Integer.MIN_VALUE, centerZ, radius = -1, view = -1;
-        private NearbyChunks scan;
-        private boolean exhausted, tickOverloaded;
+        private long movementRevision=-1;
+        private boolean tickOverloaded;
         private String failure = "";
         private boolean released;
-        private boolean wasEnabled = true;
 
         Session(ServerLevel level, WorldEngine engine) {
             this.level = level;
@@ -147,31 +149,28 @@ public final class GenerationController {
                 workers.setMaximumPoolSize(limits.threads());
             }
             drainFinished();
-            if (centerX != desired.x() || centerZ != desired.z() || radius != desired.radius() || view != desired.view()) {
+            boolean enabled = DistantConfig.ENABLED.get() && VoxyBridge.enabled();
+            if (enabled&&!desired.paused()&&(centerX==Integer.MIN_VALUE||Math.abs((long)centerX-desired.x())>32||Math.abs((long)centerZ-desired.z())>32||radius != desired.radius() || view != desired.view()||movementRevision!=desired.motion().revision())) {
                 centerX = desired.x(); centerZ = desired.z(); radius = desired.radius(); view = desired.view();
-                resetScan();
+                long timing=dev.voxydistant.DebugLog.start();movementRevision=desired.motion().revision();discovery.move(desired.motion().shape(radius,2048),view);dev.voxydistant.DebugLog.end(dev.voxydistant.DebugLog.Metric.LOCAL_RANGE,timing);
                 for (var iterator = generating.values().iterator(); iterator.hasNext();) {
                     var pending = iterator.next();
-                    if (!inRange(pending.pos)) { release(pending); iterator.remove(); }
+                    if (!inRange(pending.pos)) { release(pending);discovery.retry(pending.pos); iterator.remove(); }
                 }
-                for (var conversion : converting.values()) if (!inRange(conversion.pos)) conversion.cancelled = true;
             }
             double ms = level.getServer().getAverageTickTime();
             if (ms > 45) tickOverloaded = true;
             else if (ms < 35) tickOverloaded = false;
-            boolean enabled = DistantConfig.ENABLED.get() && VoxyBridge.enabled();
-            if (!enabled) {
+            if (!enabled||desired.paused()) {
                 for (var pending : generating.values()) release(pending);
-                generating.clear(); candidates.clear();
-                if (wasEnabled) resetScan();
+                generating.clear(); discovery.clear();
                 for (var conversion : converting.values()) conversion.cancelled = true;
             }
-            wasEnabled = enabled;
+            if(!enabled||desired.paused())movementRevision=-1;
             String reason = !enabled ? "已禁用" : desired.paused() ? "暂停菜单" : tickOverloaded ? "服务器 tick 超过预算"
                     : VoxyBridge.backedUp(engine) ? "Voxy 摄取或保存积压" : "生成中";
             if (enabled && !desired.paused() && !VoxyBridge.backedUp(engine)) snapshot(limits.snapshotMillis());
             int cap = DistantConfig.QUEUE.get();
-            if (!candidates.isEmpty() && candidates.size() + generating.size() + converting.size() > cap) resetScan();
             long now = System.nanoTime();
             submissionTokens = Math.min(Math.max(1, limits.perSecond() / 20.0),
                     submissionTokens + (now - lastSubmissionTick) / 1e9 * limits.perSecond());
@@ -185,50 +184,44 @@ public final class GenerationController {
                 if (memory.get() + retiringBytes + columnBytes > memoryLimit) reason = "快照内存上限";
                 else if (generating.size() + converting.size() >= cap) reason = "待处理列上限";
                 else if (generating.size() >= limits.concurrency()) reason = "生成并发上限";
-                else while (submissionTokens >= 1 && !candidates.isEmpty() && generating.size() < limits.concurrency()
+                else while (submissionTokens >= 1 && discovery.candidateCount()>0 && generating.size() < limits.concurrency()
                         && generating.size() + converting.size() + retiringColumns < cap
                         && memory.get() + retiringBytes + columnBytes <= memoryLimit) {
-                    var pos = candidates.removeFirst();
+                    var pos = discovery.poll();if(pos==null)break;
+                    if(!inRange(pos)||generating.containsKey(pos.toLong())||converting.containsKey(pos.toLong()))continue;
+                    long dx=(long)pos.x-desired.x(),dz=(long)pos.z-desired.z();
+                    if(Math.max(Math.abs(dx),Math.abs(dz))<=view||dx*dx+dz*dz>2048L*2048||!level.getWorldBorder().isWithinBounds(pos))continue;
+                    if(VoxyBridge.coverage(engine).hasColumn(pos.x,pos.z,level.getMinSection(),level.getMaxSection()))continue;
                     // Reserving the whole column before adding a ticket bounds even partial snapshots.
                     level.getChunkSource().addRegionTicket(TICKET, pos, 0, pos); // FULL level 33; not ticking
                     memory.addAndGet(columnBytes);
                     var pending = new Pending(pos, columnBytes, VoxyBridge.coverage(engine).revision());
                     generating.put(pos.toLong(), pending);
+                    submitted++;if(dev.voxydistant.DebugLog.verbose())dev.voxydistant.DebugLog.log("LOCAL submit x={} z={} player_x={} player_z={} amount={} submitted={}",pos.x,pos.z,desired.x(),desired.z(),desired.motion().amount(),submitted);
                     submissionTokens--;
                 }
-                if (exhausted && generating.isEmpty() && converting.isEmpty()) reason = "范围内已完成";
+                if (!discovery.busy() && generating.isEmpty() && converting.isEmpty()) reason = "范围内已完成";
             }
             status = new Status(generating.size(), converting.size() + retired.stream().mapToInt(s -> s.converting.size()).sum(), completed,
                     completed / Math.max(1.0, (System.nanoTime() - started) / 1e9),
-                    memory.get() + retired.stream().mapToLong(s -> s.memory.get()).sum(), reason, failure);
-        }
-
-        private void resetScan() {
-            candidates.clear(); scan = new NearbyChunks(radius, view); exhausted = false;
+                    memory.get() + retired.stream().mapToLong(s -> s.memory.get()).sum(), reason, failure,discovery.checks,submitted,cancelled);
+            if(++ticks%100==0&&dev.voxydistant.DebugLog.enabled()){dev.voxydistant.DebugLog.log("LOCAL discovery checks={} boundary_checks={} submitted={} cancelled={} completed={}",discovery.checks,discovery.boundaryChecks,submitted,cancelled,completed);dev.voxydistant.DebugLog.timings("LOCAL");}
         }
 
         private boolean inRange(ChunkPos pos) {
-            long dx = (long) pos.x - centerX, dz = (long) pos.z - centerZ;
-            return Math.max(Math.abs(dx), Math.abs(dz)) > view && dx * dx + dz * dz <= (long) radius * radius;
+            return discovery.contains(pos.x,pos.z);
         }
 
         private void refill(int cap) {
-            // Bounded coverage checks per tick and a bounded candidate queue.
+            if(!discovery.busy())return;
+            long timing=dev.voxydistant.DebugLog.start();
             int remaining = Math.max(0, cap - generating.size() - converting.size());
-            int scanLimit = DistantConfig.LOCAL_SCAN_COLUMNS_PER_TICK.get();
-            for (int checked = 0; checked < scanLimit && candidates.size() < remaining && !exhausted; checked++) {
-                var offset = scan.next();
-                if (offset == null) { exhausted = true; break; }
-                var pos = new ChunkPos(centerX + offset.x(), centerZ + offset.z());
-                long key = pos.toLong();
-                if (!inRange(pos) || failed.contains(key) || generating.containsKey(key) || converting.containsKey(key)
-                        || !level.getWorldBorder().isWithinBounds(pos)
-                        || VoxyBridge.coverage(engine).hasColumn(pos.x, pos.z, level.getMinSection(), level.getMaxSection())) continue;
-                candidates.add(pos);
-            }
+            discovery.step(DistantConfig.LOCAL_SCAN_COLUMNS_PER_TICK.get(),remaining,(x,z)->{var pos=new ChunkPos(x,z);long key=pos.toLong();return !failed.contains(key)&&!generating.containsKey(key)&&!converting.containsKey(key)&&level.getWorldBorder().isWithinBounds(pos)&&!VoxyBridge.coverage(engine).hasColumn(x,z,level.getMinSection(),level.getMaxSection());});
+            dev.voxydistant.DebugLog.end(dev.voxydistant.DebugLog.Metric.LOCAL_DISCOVERY,timing);
         }
 
         private void snapshot(double millis) {
+            long timing=dev.voxydistant.DebugLog.start();
             long end = System.nanoTime() + (long) (millis * 1_000_000);
             for (var iterator = generating.values().iterator(); iterator.hasNext() && System.nanoTime() < end;) {
                 var pending = iterator.next();
@@ -262,6 +255,7 @@ public final class GenerationController {
                     iterator.remove();
                 }
             }
+            dev.voxydistant.DebugLog.end(dev.voxydistant.DebugLog.Metric.LOCAL_SNAPSHOT,timing);
         }
 
         private void drainFinished() {
@@ -273,19 +267,20 @@ public final class GenerationController {
                     failure = result.pos + ": " + result.error;
                     LOG.error("Distant conversion failed at {}", result.pos, result.error);
                 } else if (!result.cancelled && VoxyBridge.coverage(engine).hasColumn(result.pos.x, result.pos.z,
-                        level.getMinSection(), level.getMaxSection())) completed++;
-                else if (!workers.isShutdown()) resetScan();
+                        level.getMinSection(), level.getMaxSection())) {completed++;if(dev.voxydistant.DebugLog.verbose())dev.voxydistant.DebugLog.log("LOCAL complete x={} z={} elapsed_ms={}",result.pos.x,result.pos.z,(System.nanoTime()-result.pending.started)/1e6);}
+                else if (!workers.isShutdown()) discovery.retry(result.pos);
             }
         }
 
         private void release(Pending pending) {
+            cancelled++;
             level.getChunkSource().removeRegionTicket(TICKET, pending.pos, 0, pending.pos);
             memory.addAndGet(-pending.bytes);
         }
 
         void close() {
             for (var pending : generating.values()) release(pending);
-            generating.clear(); candidates.clear();
+            generating.clear(); discovery.clear();
             for (var conversion : converting.values()) conversion.cancelled = true;
             workers.shutdown();
         }
@@ -325,6 +320,7 @@ public final class GenerationController {
                         if (cancelled) break;
                         long start = System.nanoTime();
                         VoxyBridge.ingest(engine, snapshot, pending.revision);
+                        dev.voxydistant.DebugLog.end(dev.voxydistant.DebugLog.Metric.LOCAL_CONVERT,dev.voxydistant.DebugLog.enabled()?start:0);
                         double duty = DistantConfig.limits().dutyCycle();
                         if (!cancelled && duty < 1) LockSupport.parkNanos((long) ((System.nanoTime() - start) * (1 / duty - 1)));
                     }

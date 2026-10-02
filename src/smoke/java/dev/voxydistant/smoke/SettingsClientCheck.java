@@ -12,7 +12,19 @@ final class SettingsClientCheck {
     static void command(JsonObject request)throws ReflectiveOperationException {
         var mc=Minecraft.getInstance();String action=request.get("command").getAsString();
         if(action.equals("settings-open")){
-            mc.setScreen(new DistantScreen(null));click("本地生成 → 接收");click("接收 → 服务端");return;
+            mc.setScreen(new DistantScreen(null));click("服务端设置  ›");return;
+        }
+        if(action.equals("settings-movement-open")){
+            mc.setScreen(new DistantScreen(null));var widgets=mc.screen.children().stream().filter(w->w instanceof AbstractWidget).map(w->(AbstractWidget)w).toList();
+            for(int i=0;i<widgets.size();i++)for(int j=i+1;j<widgets.size();j++){var a=widgets.get(i);var b=widgets.get(j);if(a.getX()<b.getX()+b.getWidth()&&b.getX()<a.getX()+a.getWidth()&&a.getY()<b.getY()+b.getHeight()&&b.getY()<a.getY()+a.getHeight())throw new AssertionError("overlapping settings buttons");}
+            click("移动预测  ›");return;
+        }
+        if(action.equals("settings-movement-check")){
+            var screen=(DistantScreen)mc.screen;var boxes=screen.children().stream().filter(w->w instanceof EditBox).map(w->(EditBox)w).toList();
+            if(boxes.size()!=3)throw new AssertionError("movement settings missing");
+            boxes.get(0).setValue("2.15");boxes.get(1).setValue("2");click("保存");
+            var error=DistantScreen.class.getDeclaredField("error");error.setAccessible(true);if(mc.screen!=screen||!error.get(screen).toString().contains("必须大于"))throw new AssertionError("speed relationship accepted");
+            boxes.get(1).setValue("22");boxes.get(2).setValue("0.5");click("保存");if(mc.screen==screen)throw new AssertionError("valid movement settings rejected");return;
         }
         if(action.equals("settings-close")){mc.screen.onClose();mc.setScreen(null);return;}
         if(action.equals("settings-refresh")){click("重新读取");return;}

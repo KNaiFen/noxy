@@ -14,7 +14,7 @@ class MovementPredictionTest {
         double x=16.5;
         for(int i=0;i<4;i++)tracker.sample(world,x+=2.2,0,false,config);
         assertEquals((x+22)/16,tracker.snapshot().centerX(),1e-9);
-        for(int i=0;i<10;i++)tracker.sample(world,x,0,false,config);
+        for(int i=0;i<6;i++)tracker.sample(world,x,0,false,config);
         assertEquals(0,tracker.snapshot().amount());
         tracker.sample(new Object(),2000,0,false,config);assertEquals(0,tracker.snapshot().speed());
     }
@@ -29,5 +29,17 @@ class MovementPredictionTest {
             }
         }
         var clipped=new RequestShape(0,0,1,0,1,0,1,32,32);assertFalse(clipped.contains(33,0));assertTrue(clipped.contains(32,0));
+    }
+    @Test void pauseAndDisableClearMotionWithoutRepeatedRangePublication(){
+        var tracker=new MovementPrediction();var world=new Object();var config=new MovementPrediction.Settings(true,2.15,22,.5);
+        tracker.sample(world,0,0,false,config);
+        for(int i=1;i<=15;i++)tracker.sample(world,i*1.1,0,false,config);
+        tracker.sample(world,16.5,0,true,config);assertEquals(0,tracker.snapshot().amount());
+        long revision=tracker.snapshot().revision();
+        for(int i=0;i<20;i++)tracker.sample(world,16.5,0,true,config);
+        assertEquals(revision,tracker.snapshot().revision());
+        tracker.sample(world,100,0,false,config);assertEquals(0,tracker.snapshot().speed());
+        tracker.sample(world,101.1,0,false,new MovementPrediction.Settings(false,2.15,22,.5));
+        assertEquals(0,tracker.snapshot().amount());assertEquals(6,tracker.snapshot().centerX());
     }
 }

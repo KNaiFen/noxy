@@ -17,11 +17,13 @@ final class RegionDiscovery {
         final BitSet needs=new BitSet(1024),verified=new BitSet(1024),urgent=new BitSet(1024),stale=new BitSet(1024);
         boolean prepare=true,migrate,query,queried,maskPending;
         int[] order;int nearCursor,farCursor;long preparedAt;
+        RequestShape orderedFor;
         Region(int x,int z){this.x=x;this.z=z;}
     }
     final LinkedHashMap<Long,Region> regions=new LinkedHashMap<>();
     private final DistanceBands bands;
     private int turn;
+    private long sequence;
     RequestShape shape;
     long boundaryChecks,prepared,checks;
     RegionDiscovery(DistanceBands bands){this.bands=bands;}
@@ -37,7 +39,7 @@ final class RegionDiscovery {
             if(next.relation(rx*32,rz*32,rx*32+31,rz*32+31)<0)continue;
             long key=key(rx,rz);active.add(key);Region region=regions.computeIfAbsent(key,k->new Region(x(k),z(k)));
             int uniform=uniform(region,next);
-            if(region.targets!=null&&uniform>=0&&region.targets[uniform].cardinality()==1024){region.maskPending=false;continue;}
+            if(region.targets!=null&&uniform>=0&&region.targets[uniform].cardinality()==1024&&region.needs.isEmpty()){region.maskPending=false;continue;}
             region.maskPending=true;
         }
         regions.keySet().retainAll(active);
@@ -48,28 +50,33 @@ final class RegionDiscovery {
         if(footprint.relation(x,z,x+31,z+31)!=1)return -1;
         for(int i=0;i<bands.radii().length;i++){
             int size=1<<(bands.levels()[i]+2),bx=Math.floorDiv(x,size)*size,bz=Math.floorDiv(z,size)*size,ex=Math.floorDiv(x+31,size)*size+size-1,ez=Math.floorDiv(z+31,size)*size+size-1;
-            int relation=footprint.radius(bands.radii()[i]).relation(bx,bz,ex,ez);
+            int relation=footprint.radius((int)Math.floor(bands.radii()[i]*footprint.precisionScale())).relation(bx,bz,ex,ez);
             if(relation==0)return -1;
             if(relation==1){
-                // The server circle can still cross this region; all four corners must agree.
-                int level=bands.levels()[i];for(int px:new int[]{x,x+31})for(int pz:new int[]{z,z+31})if(bands.select(px,pz,footprint.playerX(),footprint.playerZ())!=level)return -1;
-                return level;
+                int minimum=bands.levels()[bands.levels().length-1],maximum=minimum;
+                for(int j=0;j<bands.radii().length;j++){
+                    int width=1<<(bands.levels()[j]+2),loX=Math.floorDiv(x,width)*width,hiX=Math.floorDiv(x+31,width)*width,loZ=Math.floorDiv(z,width)*width,hiZ=Math.floorDiv(z+31,width)*width;
+                    long nx=near(loX,hiX+width-1,footprint.playerX()),nz=near(loZ,hiZ+width-1,footprint.playerZ()),mx=Math.max(near(loX,loX+width-1,footprint.playerX()),near(hiX,hiX+width-1,footprint.playerX())),mz=Math.max(near(loZ,loZ+width-1,footprint.playerZ()),near(hiZ,hiZ+width-1,footprint.playerZ()));
+                    long squared=(long)bands.radii()[j]*bands.radii()[j];if(nx*nx+nz*nz<=squared)minimum=Math.min(minimum,bands.levels()[j]);if(mx*mx+mz*mz<=squared)maximum=Math.min(maximum,bands.levels()[j]);
+                }
+                return minimum==maximum?Math.max(bands.levels()[i],minimum):-1;
             }
         }
         return bands.levels()[bands.levels().length-1];
     }
+    private static long near(int lo,int hi,int p){return Math.max(Math.max((long)lo-p,(long)p-hi),0);}
     Masks buildMasks(Region region,RequestShape footprint){
         int rx=region.x,rz=region.z,x=rx*32,z=rz*32;var result=new BitSet[5];for(int i=0;i<5;i++)result[i]=new BitSet(1024);
         int uniform=uniform(region,footprint);
         if(uniform>=0)result[uniform].set(0,1024);
         else for(int i=0;i<1024;i++){int px=x+(i&31),pz=z+(i>>5);if(footprint.contains(px,pz))result[footprint.desired(bands,px,pz)].set(i);}
         var slots=new ArrayList<Integer>();for(int i=0;i<1024;i++)for(var mask:result)if(mask.get(i)){slots.add(i);break;}
-        slots.sort(Comparator.comparingDouble((Integer i)->footprint.score(x+(i&31),z+(i>>5))).thenComparingDouble(i->footprint.actualDistance(x+(i&31),z+(i>>5))).thenComparingInt(Integer::intValue));
+        slots.sort((a,b)->footprint.compare(x+(a&31),z+(a>>5),x+(b&31),z+(b>>5)));
         return new Masks(result,uniform>=0?0:1024,slots.stream().mapToInt(Integer::intValue).toArray());
     }
     void applyMasks(Region region,RequestShape footprint,Masks masks){
         if(shape!=footprint||regions.get(key(region.x,region.z))!=region)return;
-        region.maskPending=false;region.preparedAt=++prepared;region.order=masks.order();region.nearCursor=region.farCursor=0;boundaryChecks+=masks.checks();boolean changed=region.targets==null||!Arrays.equals(region.targets,masks.targets());region.targets=masks.targets();
+        region.maskPending=false;region.preparedAt=++sequence;region.order=masks.order();region.orderedFor=footprint;region.nearCursor=region.farCursor=0;boundaryChecks+=masks.checks();boolean changed=region.targets==null||!Arrays.equals(region.targets,masks.targets());region.targets=masks.targets();
         var included=new BitSet(1024);for(var mask:region.targets)included.or(mask);region.verified.and(included);region.needs.and(included);
         if(changed&&region.local!=null)refresh(region);
     }
@@ -100,6 +107,7 @@ final class RegionDiscovery {
             else{region.needs.set(i);region.stale.set(i);}
         }
         refreshSummary(region);
+        if(!region.needs.isEmpty()&&region.orderedFor!=shape)region.maskPending=true;
         region.nearCursor=region.farCursor=0;
     }
     void updated(long position,CoverageStore.Stamp stamp){
@@ -108,26 +116,27 @@ final class RegionDiscovery {
         region.nearCursor=region.farCursor=0;
         if(stamp.level()<5){region.verified.set(slot);region.stale.clear(slot);}else{region.verified.clear(slot);region.stale.set(slot);}
         if(shape.contains(px,pz)&&stamp.level()>shape.desired(bands,px,pz))region.needs.set(slot);else region.needs.clear(slot);
+        if(!region.needs.isEmpty()&&region.orderedFor!=shape)region.maskPending=true;
         if(stamp.level()<5||shape.desired(bands,px,pz)==bands.levels()[0])region.urgent.set(slot);
     }
     void dirty(long position){var r=regions.get(key(x(position)>>5,z(position)>>5));if(r!=null){int slot=(x(position)&31)|((z(position)&31)<<5);r.verified.clear(slot);r.stale.set(slot);}}
     private void refreshSummary(Region region){
         var active=new BitSet(1024);for(var mask:region.targets)active.or(mask);region.needs.and(active);
     }
-    private double distance(Region region){return shape.minimumScore(region.x*32,region.z*32,region.x*32+31,region.z*32+31);}
     Long poll(){
         boolean far=(turn++&3)==3;Long candidate=poll(far);return candidate==null?poll(!far):candidate;
     }
     private Long poll(boolean far){
-        Region chosen=null;double best=Double.POSITIVE_INFINITY;BitSet eligible=null;
-        for(var region:regions.values())if(!region.maskPending&&!region.needs.isEmpty()&&distance(region)<best){
-            var bits=(BitSet)region.needs.clone();if(far)bits.andNot(region.urgent);else bits.and(region.urgent);
-            if(!bits.isEmpty()){chosen=region;eligible=bits;best=distance(region);}
+        Region chosen=null;int slot=-1;
+        for(var region:regions.values())if(!region.maskPending&&!region.needs.isEmpty()){
+            int cursor=far?region.farCursor:region.nearCursor;
+            while(cursor<region.order.length){int candidate=region.order[cursor];if(region.needs.get(candidate)&&region.urgent.get(candidate)!=far)break;cursor++;}
+            if(far)region.farCursor=cursor;else region.nearCursor=cursor;
+            if(cursor==region.order.length)continue;
+            int candidate=region.order[cursor],px=region.x*32+(candidate&31),pz=region.z*32+(candidate>>5);
+            if(chosen==null||shape.compare(px,pz,chosen.x*32+(slot&31),chosen.z*32+(slot>>5))<0){chosen=region;slot=candidate;}
         }
-        if(chosen==null)return null;int slot=-1,cursor=far?chosen.farCursor:chosen.nearCursor;
-        for(;cursor<chosen.order.length;cursor++)if(eligible.get(chosen.order[cursor])){slot=chosen.order[cursor++];break;}
-        if(far)chosen.farCursor=cursor;else chosen.nearCursor=cursor;
-        if(slot<0)return null;
+        if(chosen==null)return null;
         chosen.needs.clear(slot);int px=chosen.x*32+(slot&31),pz=chosen.z*32+(slot>>5);return key(px,pz);
     }
     boolean busy(){for(var r:regions.values())if(r.maskPending||r.prepare||r.query||!r.needs.isEmpty())return true;return false;}

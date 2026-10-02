@@ -9,6 +9,7 @@ public final class MovementPrediction {
         public RequestShape shape(int radius,int limit){return new RequestShape(x,z,centerX,centerZ,directionX,directionZ,amount,radius,limit);}
     }
     private Object world;
+    private boolean wasPaused;
     private Settings settings;
     private double lastX,lastZ,directionX=1,directionZ;
     private final double[] history=new double[6];
@@ -20,12 +21,12 @@ public final class MovementPrediction {
     public void sample(Object nextWorld,double x,double z,boolean paused,Settings nextSettings){
         int cx=(int)Math.floor(x/16),cz=(int)Math.floor(z/16);
         double dx=x-lastX,dz=z-lastZ;
-        boolean reset=world!=nextWorld||paused||Math.abs(dx)>512||Math.abs(dz)>512;
+        boolean reset=world!=nextWorld||paused!=wasPaused||Math.abs(dx)>512||Math.abs(dz)>512;
         boolean changed=!nextSettings.equals(settings);
         if(reset||changed){java.util.Arrays.fill(history,0);slot=0;moving=0;directionX=1;directionZ=0;}
-        world=nextWorld;settings=nextSettings;lastX=x;lastZ=z;ticks++;
+        world=nextWorld;wasPaused=paused;settings=nextSettings;lastX=x;lastZ=z;ticks++;
         double speed=reset?0:Math.hypot(dx,dz)*20;
-        if(!nextSettings.enabled||reset){dx=0;dz=0;speed=0;}
+        if(!nextSettings.enabled||reset||paused){dx=0;dz=0;speed=0;}
         if(speed>0){directionX=dx*20/speed;directionZ=dz*20/speed;}
         moving=speed>nextSettings.start?moving+1:0;
         history[slot++%6]=moving>=6?Math.min(1,(speed-nextSettings.start)/(nextSettings.maximum-nextSettings.start)):0;
@@ -33,9 +34,10 @@ public final class MovementPrediction {
         double centerX=nextSettings.enabled?x/16+dx*20*nextSettings.seconds/16:cx;
         double centerZ=nextSettings.enabled?z/16+dz*20*nextSettings.seconds/16:cz;
         if(reset||changed||ticks%5==0){
+            if(reset||changed)revision++;
             if(published==null||published.x!=cx||published.z!=cz||published.centerX!=centerX||published.centerZ!=centerZ||published.directionX!=directionX||published.directionZ!=directionZ||published.amount!=amount)revision++;
             published=new Snapshot(cx,cz,centerX,centerZ,directionX,directionZ,amount,speed,revision,reset||changed);
         }
-        snapshot=new Snapshot(cx,cz,published.centerX,published.centerZ,published.directionX,published.directionZ,published.amount,speed,revision,reset||changed);
+        snapshot=new Snapshot(cx,cz,centerX,centerZ,directionX,directionZ,amount,speed,revision,reset||changed);
     }
 }

@@ -33,6 +33,7 @@ public final class LodClientBenchmark {
     private Channel channel;
     private float cameraYaw;
     private double cameraX,cameraZ;
+    private double cruiseSpeed=22;private com.google.gson.JsonArray cruiseRoute;private int cruiseSegment;
     private int auditedInsufficient;
     private boolean recording;
     private volatile boolean recordingPending;
@@ -42,6 +43,7 @@ public final class LodClientBenchmark {
     private Object voxyImporter;
     private me.cortex.voxy.commonImpl.ImportManager voxyImportManager;
     private java.lang.reflect.Field voxyImportTasks;
+    private boolean holdLocalPause;
     private me.cortex.voxy.common.world.service.SectionSavingService voxySaving;
     private final PrintWriter importSamples;
     public LodClientBenchmark()throws IOException {
@@ -59,6 +61,7 @@ public final class LodClientBenchmark {
     }
     private void frame(TickEvent.RenderTickEvent e) {
         if(e.phase!=TickEvent.Phase.END)return;
+        if(holdLocalPause&&!(Minecraft.getInstance().screen instanceof net.minecraft.client.gui.screens.PauseScreen))Minecraft.getInstance().setScreen(new net.minecraft.client.gui.screens.PauseScreen(true));
         if(recordingFailure!=null)throw recordingFailure;
         long now=System.nanoTime();if(lastFrame!=0)frames.printf(Locale.ROOT,"%d,%d,%s%n",now,now-lastFrame,Minecraft.getInstance().level!=null);lastFrame=now;
         if(capture==null&&recording&&!recordingPending&&now-lastRecordedFrame>=200_000_000L){
@@ -98,6 +101,10 @@ public final class LodClientBenchmark {
         state.addProperty("receive_memory_mib",DistantConfig.RECEIVE_MIB.get());
         state.addProperty("request_window_columns",DistantConfig.REQUEST_WINDOW.get());
         state.addProperty("mask_bypass",Boolean.getBoolean("voxyDistant.maskBypass"));
+        var motion=dev.voxydistant.movement.MovementPrediction.CLIENT.snapshot();state.addProperty("prediction_speed",motion.speed());state.addProperty("prediction_amount",motion.amount());state.addProperty("prediction_center_x",motion.centerX());state.addProperty("prediction_center_z",motion.centerZ());
+        state.addProperty("cruise_segment",cruiseSegment);state.addProperty("cruise_done",cruiseRoute!=null&&cruiseSegment>=cruiseRoute.size());
+        var local=dev.voxydistant.generation.GenerationController.status();state.addProperty("local_completed",local.completed());state.addProperty("local_generating",local.generating());state.addProperty("local_converting",local.converting());state.addProperty("local_bytes",local.bytes());state.addProperty("local_reason",local.reason());state.addProperty("local_failure",local.failure());
+        state.addProperty("local_checks",local.checks());state.addProperty("local_submitted",local.submitted());state.addProperty("local_cancelled",local.cancelled());
         SettingsClientCheck.state(state);
         if(mc.screen instanceof ConnectScreen){
             var connection=(net.minecraft.network.Connection)LodMetrics.field(mc.screen,"connection");
@@ -132,6 +139,10 @@ public final class LodClientBenchmark {
     }
     private void tick(TickEvent.ClientTickEvent e) {
         if(e.phase!=TickEvent.Phase.END)return;
+        if(cruiseRoute!=null&&cruiseSegment<cruiseRoute.size()){
+            var point=cruiseRoute.get(cruiseSegment).getAsJsonArray();double x=point.get(0).getAsDouble()*16,z=point.get(1).getAsDouble()*16,dx=x-cameraX,dz=z-cameraZ,distance=Math.hypot(dx,dz),step=cruiseSpeed/20;
+            if(distance<=step){cameraX=x;cameraZ=z;cruiseSegment++;}else{cameraX+=dx/distance*step;cameraZ+=dz/distance*step;}
+        }
         if(Boolean.getBoolean("voxyDistant.fixedCamera")&&Minecraft.getInstance().player!=null){var p=Minecraft.getInstance().player;p.setPos(cameraX,180,cameraZ);p.setYRot(cameraYaw);p.setXRot(15);}
         var mc=Minecraft.getInstance();long now=System.nanoTime();if(now-lastSample<1_000_000_000)return;lastSample=now;
         try {
@@ -176,6 +187,10 @@ public final class LodClientBenchmark {
                         else if(command.equals("renderer")){dev.voxydistant.compat.VoxyBridge.resetRenderer();}
                         else if(command.equals("turn")){cameraYaw+=90;}
                         else if(command.equals("move-camera")){cameraX=request.get("x").getAsDouble();cameraZ=request.get("z").getAsDouble();mc.player.setPos(cameraX,180,cameraZ);}
+                        else if(command.equals("cruise")){cruiseRoute=request.getAsJsonArray("waypoints");cruiseSegment=0;cruiseSpeed=request.has("speed")?request.get("speed").getAsDouble():22;}
+                        else if(command.equals("prediction-local")){mc.options.pauseOnLostFocus=false;mc.setScreen(null);DistantConfig.RECEIVE.set(false);DistantConfig.ENABLED.set(true);DistantConfig.RADIUS.set(24);}
+                        else if(command.equals("local-disable")){holdLocalPause=false;mc.setScreen(null);DistantConfig.ENABLED.set(false);}
+                        else if(command.equals("local-pause")){holdLocalPause=true;mc.setScreen(new net.minecraft.client.gui.screens.PauseScreen(true));}
                         else if(command.equals("mask-off")){System.setProperty("voxyDistant.maskBypass","true");}
                         else if(command.equals("mask-on")){System.setProperty("voxyDistant.maskBypass","false");}
                         else if(command.equals("audit")){auditCursor=0;auditedLevels=new int[6];auditedInsufficient=0;}

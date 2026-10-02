@@ -25,7 +25,7 @@ public final class DistantScreen extends Screen {
             new Setting("负载预设", "CUSTOM 使用下面的自定义参数。", DistantConfig.PRESET),
             new Setting("待处理列上限", "本地生成队列的列数上限。", DistantConfig.QUEUE),
             new Setting("快照内存 MiB", "本地生成快照预算。", DistantConfig.MEMORY),
-            new Setting("本地扫描（列/tick）", "每 tick 最多检查多少列本地生成覆盖范围；调高可更快发现未生成列，但增加客户端主线程索引查询开销。", DistantConfig.LOCAL_SCAN_COLUMNS_PER_TICK),
+            new Setting("本地扫描（列/tick）", "内置服务器每 tick 检查新增范围的最多列数，另受约 2 ms 软预算限制。调高可更快发现缺口，也会增加覆盖查询开销。", DistantConfig.LOCAL_SCAN_COLUMNS_PER_TICK),
             new Setting("转换线程（自定义）", "仅在 CUSTOM 预设下生效。", DistantConfig.THREADS),
             new Setting("生成并发（自定义）", "仅在 CUSTOM 预设下生效。", DistantConfig.CONCURRENCY),
             new Setting("提交/秒（自定义）", "仅在 CUSTOM 预设下生效。", DistantConfig.PER_SECOND),
@@ -189,15 +189,15 @@ public final class DistantScreen extends Screen {
             }
         } else {
             var state = GenerationController.status();
-            if (height >= 205) {
-                graphics.drawString(font, String.format(Locale.ROOT, "生成 %d · 转换 %d · 已完成 %d · %.1f 列/秒", state.generating(), state.converting(), state.completed(), state.perSecond()), left, 113, 0xDDDDDD);
+            if (height >= 235) {
+                graphics.drawString(font, String.format(Locale.ROOT, "生成 %d · 转换 %d · 已完成 %d · %.1f 列/秒", state.generating(), state.converting(), state.completed(), state.perSecond()), left, 145, 0xDDDDDD);
                 RemoteClient.requestCacheStats();
-                graphics.drawString(font, font.plainSubstrByWidth(RemoteClient.receiveSpeed(), span), left, 126, 0xDDDDDD);
-                graphics.drawString(font, font.plainSubstrByWidth(RemoteClient.cacheStatus(), span), left, 139, 0xDDDDDD);
-                if(height>=220){
-                    graphics.drawString(font,font.plainSubstrByWidth(RemoteClient.radiusStatus(),span),left,152,0xFFCC66);
-                    graphics.drawString(font,font.plainSubstrByWidth(RemoteClient.indexStatus(),span),left,165,0xDDDDDD);
-                    if(height>=235){RemoteClient.requestLocalCacheStats();graphics.drawString(font,font.plainSubstrByWidth(RemoteClient.localCacheStatus(),span),left,178,0xDDDDDD);}
+                graphics.drawString(font, font.plainSubstrByWidth(RemoteClient.receiveSpeed(), span), left, 158, 0xDDDDDD);
+                graphics.drawString(font, font.plainSubstrByWidth(RemoteClient.cacheStatus(), span), left, 171, 0xDDDDDD);
+                if(height>=270){
+                    graphics.drawString(font,font.plainSubstrByWidth(RemoteClient.radiusStatus(),span),left,184,0xFFCC66);
+                    graphics.drawString(font,font.plainSubstrByWidth(RemoteClient.indexStatus(),span),left,197,0xDDDDDD);
+                    if(height>=290){RemoteClient.requestLocalCacheStats();graphics.drawString(font,font.plainSubstrByWidth(RemoteClient.localCacheStatus(),span),left,210,0xDDDDDD);}
                 }
             }
         }

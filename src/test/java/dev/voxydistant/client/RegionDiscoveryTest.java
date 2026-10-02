@@ -9,10 +9,26 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 class RegionDiscoveryTest {
+    @org.junit.jupiter.api.Test void predictionCpuBenchmark()throws Exception{
+        var bean=java.lang.management.ManagementFactory.getThreadMXBean();bean.setThreadCpuTimeEnabled(true);
+        var bands=dev.voxydistant.config.DistanceBands.parse(java.util.List.of("32:0","64:1","96:2"));
+        var discovery=new RegionDiscovery(bands);long start=bean.getCurrentThreadCpuTime();long missing=0;
+        for(int step=0;step<12;step++){
+            var shape=new dev.voxydistant.movement.RequestShape(step,0,step+.6875,0,1,0,1,192,256);discovery.move(shape);
+            for(var r:discovery.regions.values())if(r.maskPending)discovery.applyMasks(r,shape,discovery.buildMasks(r,shape));
+            if(step==0)for(var r:discovery.regions.values()){
+                var ctor=dev.voxydistant.compat.CoverageStore.Directory.class.getDeclaredConstructor(int.class,int.class);ctor.setAccessible(true);var directory=ctor.newInstance(-4,20);
+                for(int i=0;i<1024;i++){int x=r.x*32+(i&31),z=r.z*32+(i>>5);if((long)x*x+(long)z*z<128L*128){directory.versions[i]=1;directory.levels[i]=0;}}
+                discovery.local(r,directory);
+            }
+        }
+        long cpu=bean.getCurrentThreadCpuTime()-start;for(var r:discovery.regions.values())missing+=r.needs.cardinality();
+        System.out.printf(java.util.Locale.ROOT,"PREDICTION_REMOTE_CPU steps=12 radius=192 limit=256 cpu_ms=%.3f regions=%d boundary_checks=%d directory_checks=%d missing=%d%n",cpu/1e6,discovery.regions.size(),discovery.boundaryChecks,discovery.checks,missing);
+    }
     @org.junit.jupiter.api.Test void predictionMasksMatchReferenceAndStopRechecking(){
         var bands=dev.voxydistant.config.DistanceBands.parse(java.util.List.of("32:0","64:1","96:2"));
         for(int heading=0;heading<8;heading++){
-            double angle=heading*Math.PI/4;var shape=new dev.voxydistant.movement.RequestShape(-3,-9,-2,-8,Math.cos(angle),Math.sin(angle),1,96,128);
+            double angle=heading*Math.PI/4;var shape=new dev.voxydistant.movement.RequestShape(-3,-9,-2,-8,Math.cos(angle),Math.sin(angle),1,96,128).precision(heading%2==0?1:.5);
             var discovery=new RegionDiscovery(bands);discovery.move(shape);
             for(var r:discovery.regions.values())discovery.applyMasks(r,shape,discovery.buildMasks(r,shape));
             for(int z=-140;z<140;z++)for(int x=-140;x<140;x++){
@@ -40,6 +56,10 @@ class RegionDiscoveryTest {
         for(var r:scan.regions.values())scan.local(r,cache.directory(r.x,r.z,false));
         int near=0,far=0;for(int i=0;i<64;i++){long p=scan.poll();if(bands.select(RegionDiscovery.x(p),RegionDiscovery.z(p),0,0)==0)near++;else far++;}
         assertEquals(48,near);assertEquals(16,far);
+        for(var r:scan.regions.values()){r.urgent.clear();r.nearCursor=r.farCursor=0;}
+        for(int i=0;i<64;i++)assertNotNull(scan.poll(),"far queue borrows all empty near quota");
+        for(var r:scan.regions.values()){r.urgent.or(r.needs);r.nearCursor=r.farCursor=0;}
+        for(int i=0;i<64;i++)assertNotNull(scan.poll(),"near queue borrows all empty far quota");
         var region=scan.regions.get(RegionDiscovery.key(1,0));long pos=RegionDiscovery.key(40,0);scan.updated(pos,new CoverageStore.Stamp(10,1));
         long[] versions=new long[1024];byte[] masks=new byte[1024];java.util.Arrays.fill(versions,11);java.util.Arrays.fill(masks,(byte)31);
         scan.summary(region,versions,masks);assertTrue(region.needs.get(8));
