@@ -28,6 +28,9 @@ public final class LodDatabase implements AutoCloseable {
     private static final byte[] COUNT_PROGRESS="cached-columns-progress".getBytes(StandardCharsets.UTF_8);
     private static final byte[] INDEX_PROGRESS="lod-directory-progress-v1".getBytes(StandardCharsets.UTF_8);
     private volatile boolean indexComplete;
+    private byte[] indexReadingFrom,indexReadingThrough;
+    private boolean indexReadingExhausted;
+    private long indexAddedDuringRead;
     private volatile long cachedColumns=-1;
     private long counted;
     private byte[] countedThrough;
@@ -109,30 +112,51 @@ public final class LodDatabase implements AutoCloseable {
     public boolean indexComplete(){return indexComplete;}
     public record IndexProgress(long columns,boolean complete){}
     /** Startup-only legacy pass. New writes already maintain metadata in their terrain batch. */
-    public synchronized IndexProgress rebuildIndexStep(){
-        byte[] progress=get(INDEX_PROGRESS);
-        if(indexComplete)return new IndexProgress(ByteBuffer.wrap(progress,1,8).getLong(),true);
-        long columns=progress==null?0:ByteBuffer.wrap(progress,1,8).getLong();
-        byte[] after=progress==null?null:Arrays.copyOfRange(progress,9,progress.length);
-        var page=keys(1,after,64);long deadline=System.nanoTime()+2_000_000L;int visited=0;
-        try(var batch=new WriteBatch()){
-            for(byte[] column:page.keys()){
-                byte[] meta=metadataKey(column);if(db.get(meta)==null)batch.put(meta,legacyMetadata(column).encode());
-                after=column;columns++;visited++;if(System.nanoTime()>=deadline)break;
-            }
-            boolean done=page.exhausted()&&visited==page.keys().size();
-            batch.put(INDEX_PROGRESS,ByteBuffer.allocate(9+(after==null?0:after.length)).put((byte)(done?1:0)).putLong(columns).put(after==null?new byte[0]:after).array());
-            if(done&&cachedColumns<0){batch.put(COUNT,ByteBuffer.allocate(8).putLong(columns).array());batch.delete(COUNT_PROGRESS);}
-            db.write(writes,batch);if(done){if(cachedColumns<0)cachedColumns=columns;sync();indexComplete=true;}
-            return new IndexProgress(columns,done);
+    public IndexProgress rebuildIndexStep(){return rebuildIndexStep(null);}
+    public IndexProgress rebuildIndexStep(java.util.concurrent.ExecutorService readers){
+        KeyPage page;byte[] after;
+        synchronized(this){
+            byte[] progress=get(INDEX_PROGRESS);
+            if(indexComplete)return new IndexProgress(ByteBuffer.wrap(progress,1,8).getLong(),true);
+            after=progress==null?null:Arrays.copyOfRange(progress,9,progress.length);
+            page=keys(1,after,readers==null?64:384);
+            indexReadingFrom=after;indexReadingThrough=page.keys().isEmpty()?after:page.keys().getLast();indexReadingExhausted=page.exhausted();indexAddedDuringRead=0;
+        }
+        var results=new ArrayList<java.util.concurrent.CompletableFuture<Map<byte[],Metadata>>>();
+        for(int start=0;start<page.keys().size();start+=64){
+            var columns=page.keys().subList(start,Math.min(start+64,page.keys().size()));
+            java.util.function.Supplier<Map<byte[],Metadata>> read=()->{var entries=new LinkedHashMap<byte[],Metadata>();for(byte[] column:columns)if(get(metadataKey(column))==null)entries.put(column,legacyMetadata(column));return entries;};
+            results.add(readers==null?java.util.concurrent.CompletableFuture.completedFuture(read.get()):java.util.concurrent.CompletableFuture.supplyAsync(read,readers));
+        }
+        try{
+            java.util.concurrent.CompletableFuture.allOf(results.toArray(java.util.concurrent.CompletableFuture[]::new)).join();
+            synchronized(this){try(var batch=new WriteBatch()){
+                for(var result:results)for(var entry:result.join().entrySet()){
+                    byte[] column=entry.getKey(),meta=metadataKey(column);
+                    if(db.get(meta)!=null)continue; // A live terrain write wins over the legacy snapshot.
+                    byte[] invalid=db.get(keyWithKind(column,2));var before=entry.getValue();
+                    batch.put(meta,new Metadata(before.version(),invalid==null?0:ByteBuffer.wrap(invalid).getLong(),before.mask()).encode());
+                }
+                byte[] progress=get(INDEX_PROGRESS);long columns=(progress==null?0:ByteBuffer.wrap(progress,1,8).getLong())+page.keys().size()+indexAddedDuringRead;
+                after=indexReadingThrough;boolean done=page.exhausted();
+                batch.put(INDEX_PROGRESS,ByteBuffer.allocate(9+(after==null?0:after.length)).put((byte)(done?1:0)).putLong(columns).put(after==null?new byte[0]:after).array());
+                if(done&&cachedColumns<0){batch.put(COUNT,ByteBuffer.allocate(8).putLong(columns).array());batch.delete(COUNT_PROGRESS);}
+                db.write(writes,batch);if(done){if(cachedColumns<0)cachedColumns=columns;sync();indexComplete=true;}
+                return new IndexProgress(columns,done);
+            }}
         }catch(RocksDBException e){throw new IllegalStateException("LOD startup index migration failed",e);}
+        finally{synchronized(this){indexReadingFrom=indexReadingThrough=null;indexReadingExhausted=false;indexAddedDuringRead=0;}}
     }
     private void addColumn(WriteBatch batch,byte[] key)throws RocksDBException{
         if(cachedColumns>=0)batch.put(COUNT,ByteBuffer.allocate(8).putLong(cachedColumns+1).array());
         else if(countedThrough!=null&&Arrays.compareUnsigned(key,countedThrough)<=0)batch.put(COUNT_PROGRESS,countProgress(counted+1));
         if(!indexComplete){byte[] index=db.get(INDEX_PROGRESS);if(index!=null&&index.length>9&&Arrays.compareUnsigned(key,Arrays.copyOfRange(index,9,index.length))<=0){var b=ByteBuffer.wrap(index);b.putLong(1,b.getLong(1)+1);batch.put(INDEX_PROGRESS,index);}}
     }
-    private void columnAdded(byte[] key){if(cachedColumns>=0)cachedColumns++;else if(countedThrough!=null&&Arrays.compareUnsigned(key,countedThrough)<=0)counted++;}
+    private void columnAdded(byte[] key){
+        if(cachedColumns>=0)cachedColumns++;else if(countedThrough!=null&&Arrays.compareUnsigned(key,countedThrough)<=0)counted++;
+        if((indexReadingThrough!=null||indexReadingExhausted)&&(indexReadingFrom==null||Arrays.compareUnsigned(key,indexReadingFrom)>0)
+                &&(indexReadingExhausted||Arrays.compareUnsigned(key,indexReadingThrough)<=0))indexAddedDuringRead++;
+    }
     public CacheStats cacheStats() {
         try(var files=Files.walk(path)) {
             long size=files.filter(Files::isRegularFile).mapToLong(file->{

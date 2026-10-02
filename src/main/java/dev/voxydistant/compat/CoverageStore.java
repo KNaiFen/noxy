@@ -402,14 +402,26 @@ public final class CoverageStore {
     public synchronized void closeUnconfirmed(){closeDatabase(path.resolveSibling(path.getFileName()+".rocksdb"));pages=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();lru.clear();directories.clear();}
     public record DirectoryProgress(long pages,boolean complete){}
     public static boolean directoriesComplete(LodDatabase db){byte[] progress=db.get(DIRECTORY_PROGRESS);return progress!=null&&progress[0]!=0;}
-    public static DirectoryProgress rebuildDirectoriesStep(LodDatabase db){
+    public static DirectoryProgress rebuildDirectoriesStep(LodDatabase db){return rebuildDirectoriesStep(db,null);}
+    public static DirectoryProgress rebuildDirectoriesStep(LodDatabase db,ExecutorService readers){
+        LodDatabase.KeyPage next;
         synchronized(db){
             byte[] progress=db.get(DIRECTORY_PROGRESS);long pages=progress==null?0:ByteBuffer.wrap(progress,1,8).getLong();
             if(progress!=null&&progress[0]!=0)return new DirectoryProgress(pages,true);
-            byte[] after=progress==null?null:Arrays.copyOfRange(progress,9,progress.length);var next=db.keys(1,after,1);var batch=new HashMap<byte[],byte[]>();
-            for(byte[] k:next.keys()){
-                long id=ByteBuffer.wrap(k,1,8).getLong();byte[] existing=db.get(directoryKey(id));
-                if(existing==null||ByteBuffer.wrap(existing).getInt()!=Directory.FORMAT)batch.put(directoryKey(id),Directory.fromCoverage(db.get(k),ny(id)*32).encode());
+            byte[] after=progress==null?null:Arrays.copyOfRange(progress,9,progress.length);next=db.keys(1,after,readers==null?1:6);
+        }
+        var results=new ArrayList<CompletableFuture<byte[]>>();
+        for(byte[] k:next.keys()){
+            java.util.function.Supplier<byte[]> read=()->{long id=ByteBuffer.wrap(k,1,8).getLong();byte[] existing=db.get(directoryKey(id));return existing==null||ByteBuffer.wrap(existing).getInt()!=Directory.FORMAT?Directory.fromCoverage(db.get(k),ny(id)*32).encode():null;};
+            results.add(readers==null?CompletableFuture.completedFuture(read.get()):CompletableFuture.supplyAsync(read,readers));
+        }
+        CompletableFuture.allOf(results.toArray(CompletableFuture[]::new)).join();
+        synchronized(db){
+            byte[] progress=db.get(DIRECTORY_PROGRESS);long pages=progress==null?0:ByteBuffer.wrap(progress,1,8).getLong();byte[] after=progress==null?null:Arrays.copyOfRange(progress,9,progress.length);
+            var batch=new HashMap<byte[],byte[]>();
+            for(int i=0;i<next.keys().size();i++){
+                byte[] k=next.keys().get(i),directoryKey=directoryKey(ByteBuffer.wrap(k,1,8).getLong()),value=results.get(i).join();
+                if(value!=null){byte[] current=db.get(directoryKey);if(current==null||ByteBuffer.wrap(current).getInt()!=Directory.FORMAT)batch.put(directoryKey,value);}
                 after=k;pages++;
             }
             batch.put(DIRECTORY_PROGRESS,ByteBuffer.allocate(9+(after==null?0:after.length)).put((byte)(next.exhausted()?1:0)).putLong(pages).put(after==null?new byte[0]:after).array());db.batch(batch);

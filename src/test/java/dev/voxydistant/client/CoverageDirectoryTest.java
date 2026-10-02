@@ -80,4 +80,32 @@ class CoverageDirectoryTest {
         CacheIndexStartup.start(directory).get(10,java.util.concurrent.TimeUnit.SECONDS);
         for(Path file:paths){var cache=new CoverageStore(file);cache.remote(0,1,256);assertEquals(new CoverageStore.Stamp(10,0),cache.directory(0,0,false).column(0));cache.closeUnconfirmed();}
     }
+    @Test void sixPageReadersDoNotBlockConfirmedLiveSave()throws Exception{
+        Path file=directory.resolve("parallel.bin"),dbPath=file.resolveSibling("parallel.bin.rocksdb");
+        var cache=new CoverageStore(file);cache.remote(0,1,256);
+        for(int i=0;i<6;i++)cache.received(i*32,0,0,7,2,false);cache.saveAfterWorldClosed();
+        try(var options=new org.rocksdb.Options();var raw=org.rocksdb.RocksDB.open(options,dbPath.toString())){
+            for(int i=0;i<6;i++)raw.delete(java.nio.ByteBuffer.allocate(9).put((byte)4).putLong(CoverageStore.node(4,i,0,0)).array());
+        }
+        var entered=new java.util.concurrent.CountDownLatch(6);var release=new java.util.concurrent.CountDownLatch(1);
+        var decoded=new java.util.concurrent.CountDownLatch(5);var last=new java.util.concurrent.CountDownLatch(1);var order=new java.util.concurrent.atomic.AtomicInteger();
+        var readers=new java.util.concurrent.ThreadPoolExecutor(6,6,0,java.util.concurrent.TimeUnit.SECONDS,new java.util.concurrent.LinkedBlockingQueue<>()){
+            @Override protected void beforeExecute(Thread t,Runnable r){int lane=order.getAndIncrement();entered.countDown();try{if(lane==5)last.await();else release.await();}catch(InterruptedException e){Thread.currentThread().interrupt();throw new IllegalStateException(e);}}
+            @Override protected void afterExecute(Runnable r,Throwable e){decoded.countDown();}
+        };
+        var db=CoverageStore.openDatabase(dbPath).join();
+        try{
+            var pending=java.util.concurrent.CompletableFuture.supplyAsync(()->CoverageStore.rebuildDirectoriesStep(db,readers));
+            try{
+                assertTrue(entered.await(10,java.util.concurrent.TimeUnit.SECONDS));
+                cache=new CoverageStore(file);cache.remote(0,1,256);cache.received(0,0,0,10,0,true);cache.saveAfterWorldClosed();
+            }finally{release.countDown();}
+            try{
+                assertTrue(decoded.await(10,java.util.concurrent.TimeUnit.SECONDS));
+                cache=new CoverageStore(file);cache.remote(0,1,256);cache.received(32,0,0,12,0,true);cache.saveAfterWorldClosed();
+            }finally{last.countDown();}
+            assertTrue(pending.get(10,java.util.concurrent.TimeUnit.SECONDS).complete());
+            cache=new CoverageStore(file);cache.remote(0,1,256);assertEquals(new CoverageStore.Stamp(10,0),cache.directory(0,0,false).column(0));assertEquals(new CoverageStore.Stamp(12,0),cache.directory(1,0,false).column(0));assertEquals(0,cache.usage().pages());cache.closeUnconfirmed();
+        }finally{release.countDown();last.countDown();readers.shutdown();assertTrue(readers.awaitTermination(10,java.util.concurrent.TimeUnit.SECONDS));CoverageStore.closeDatabase(dbPath);}
+    }
 }

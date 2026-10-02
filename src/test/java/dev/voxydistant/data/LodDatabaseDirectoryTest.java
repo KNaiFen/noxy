@@ -84,4 +84,34 @@ class LodDatabaseDirectoryTest {
             assertEquals(10,db.region("minecraft:overworld",-1,-1)[1023].version());
         }
     }
+    @Test void sixReadersAllowLiveWritesAndKeepAccurateCount()throws Exception{
+        RocksDB.loadLibrary();
+        try(var options=new Options().setCreateIfMissing(true);var raw=RocksDB.open(options,directory.toString())){
+            for(int i=0;i<600;i++)raw.put(key(i*2,0),body(7));
+        }
+        var entered=new java.util.concurrent.CountDownLatch(6);var release=new java.util.concurrent.CountDownLatch(1);
+        var decoded=new java.util.concurrent.CountDownLatch(5);var last=new java.util.concurrent.CountDownLatch(1);var order=new java.util.concurrent.atomic.AtomicInteger();
+        var readers=new java.util.concurrent.ThreadPoolExecutor(6,6,0,java.util.concurrent.TimeUnit.SECONDS,new java.util.concurrent.LinkedBlockingQueue<>()){
+            @Override protected void beforeExecute(Thread t,Runnable r){int lane=order.getAndIncrement();entered.countDown();try{if(lane==5)last.await();else release.await();}catch(InterruptedException e){Thread.currentThread().interrupt();throw new IllegalStateException(e);}}
+            @Override protected void afterExecute(Runnable r,Throwable e){decoded.countDown();}
+        };
+        try(var db=new LodDatabase(directory,8L<<20)){
+            var pending=java.util.concurrent.CompletableFuture.supplyAsync(()->db.rebuildIndexStep(readers));
+            try{
+                assertTrue(entered.await(10,java.util.concurrent.TimeUnit.SECONDS),"six tasks must run concurrently");
+                db.storeColumn(key(0,0),body(10),10,31);
+                db.storeColumn(key(1,0),body(9),9,31); // In the selected key range, absent from its snapshot.
+                db.storeColumn(LodDatabase.key("minecraft:aaa",0,1),body(8),8,31);
+                db.invalidationsAndMissing(Map.of(LodDatabase.key("minecraft:overworld",2L,2),ByteBuffer.allocate(8).putLong(11).array()),List.of());
+            }finally{release.countDown();}
+            try{
+                assertTrue(decoded.await(10,java.util.concurrent.TimeUnit.SECONDS));
+                db.storeColumn(key(0,0),body(12),12,31); // Readers have parsed old snapshots; commit must retain this update.
+                db.invalidationsAndMissing(Map.of(LodDatabase.key("minecraft:overworld",2L,2),ByteBuffer.allocate(8).putLong(13).array()),List.of());
+            }finally{last.countDown();}
+            assertFalse(pending.get(10,java.util.concurrent.TimeUnit.SECONDS).complete());
+            while(!db.rebuildIndexStep(readers).complete()){}
+            assertEquals(602,db.cacheStats().columns());assertEquals(12,db.metadata(key(0,0)).version());assertEquals(13,db.metadata(key(2,0)).invalid());assertFalse(db.metadata(key(2,0)).current());
+        }finally{release.countDown();last.countDown();readers.shutdown();assertTrue(readers.awaitTermination(10,java.util.concurrent.TimeUnit.SECONDS));}
+    }
 }
