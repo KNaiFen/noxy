@@ -9,6 +9,8 @@ import java.nio.file.Files;
 import java.nio.charset.StandardCharsets;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.io.ByteArrayInputStream;
+import com.github.luben.zstd.ZstdInputStreamNoFinalizer;
 import java.util.*;
 
 /** Owned by background workers. Separate namespace from Voxy's database. */
@@ -22,7 +24,16 @@ public final class LodDatabase implements AutoCloseable {
     private final Path path;
     private final long[] calls=new long[4], nanos=new long[4], maximum=new long[4], bytes=new long[4], errors=new long[4];
     private long reportAt, missing;
-    private volatile long cachedColumns;
+    private static final byte[] COUNT="cached-columns".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] COUNT_PROGRESS="cached-columns-progress".getBytes(StandardCharsets.UTF_8);
+    private volatile long cachedColumns=-1;
+    private long counted;
+    private byte[] countedThrough;
+    public record Metadata(long version,long invalid,int mask) {
+        public boolean current(){return mask!=0&&version>=invalid;}
+        byte[] encode(){return ByteBuffer.allocate(17).putLong(version).putLong(invalid).put((byte)mask).array();}
+        static Metadata decode(byte[] bytes){var b=ByteBuffer.wrap(bytes);return new Metadata(b.getLong(),b.getLong(),b.get()&255);}
+    }
     public record CacheStats(long bytes, long columns) {}
     public LodDatabase(Path path, long cacheBytes) {
         this.path=path;
@@ -36,6 +47,14 @@ public final class LodDatabase implements AutoCloseable {
         try {
             java.nio.file.Files.createDirectories(path);
             db = RocksDB.open(options, path.toString());
+            byte[] count=db.get(COUNT),progress=db.get(COUNT_PROGRESS);
+            if(count!=null)cachedColumns=ByteBuffer.wrap(count).getLong();
+            else if(progress!=null){var b=ByteBuffer.wrap(progress);counted=b.getLong();countedThrough=new byte[b.remaining()];b.get(countedThrough);}
+            else try(var iterator=db.newIterator()){
+                iterator.seek(new byte[]{1});
+                if(!iterator.isValid()||iterator.key()[0]!=1){cachedColumns=0;db.put(writes,COUNT,ByteBuffer.allocate(8).putLong(0).array());}
+                iterator.status();
+            }
             if(started!=0)DebugLog.log("DATABASE open path={} cache_bytes={} elapsed_ms={}",path,cacheBytes,DebugLog.millis(System.nanoTime()-started));
         } catch (RocksDBException | java.io.IOException e) { throw new IllegalStateException("Cannot open LOD database " + path, e); }
     }
@@ -49,16 +68,32 @@ public final class LodDatabase implements AutoCloseable {
         try { db.put(writes, key, value);success=true; } catch (RocksDBException e) { throw new IllegalStateException("LOD write failed", e); }
         finally { diagnostic(1,started,value.length,success,false); }
     }
-    /** Count stored LOD columns (kind 1), excluding invalidations and pending work. */
-    public synchronized void countCachedColumns() {
-        long count=0;
+    /** One bounded statistics pass, only requested by the settings UI. Writes share this monitor. */
+    public synchronized boolean countCachedColumnsStep() {
+        if(cachedColumns>=0)return true;
         try(var iterator=db.newIterator()) {
-            iterator.seek(new byte[]{1});
-            while(iterator.isValid()&&iterator.key()[0]==1){count++;iterator.next();}
+            iterator.seek(countedThrough==null?new byte[]{1}:countedThrough);
+            if(countedThrough!=null&&iterator.isValid()&&Arrays.equals(iterator.key(),countedThrough))iterator.next();
+            for(int n=0;n<1024&&iterator.isValid()&&iterator.key()[0]==1;n++){
+                counted++;countedThrough=iterator.key();iterator.next();
+            }
             iterator.status();
+            boolean done=!iterator.isValid()||iterator.key()[0]!=1;
+            try(var batch=new WriteBatch()){
+                if(done){batch.put(COUNT,ByteBuffer.allocate(8).putLong(counted).array());batch.delete(COUNT_PROGRESS);}
+                else batch.put(COUNT_PROGRESS,countProgress(counted));
+                db.write(writes,batch);
+            }
+            if(done)cachedColumns=counted;
+            return done;
         }catch(RocksDBException e){throw new IllegalStateException("LOD cache count failed",e);}
-        cachedColumns=count;
     }
+    private byte[] countProgress(long count){return ByteBuffer.allocate(8+(countedThrough==null?0:countedThrough.length)).putLong(count).put(countedThrough==null?new byte[0]:countedThrough).array();}
+    private void addColumn(WriteBatch batch,byte[] key)throws RocksDBException{
+        if(cachedColumns>=0)batch.put(COUNT,ByteBuffer.allocate(8).putLong(cachedColumns+1).array());
+        else if(countedThrough!=null&&Arrays.compareUnsigned(key,countedThrough)<=0)batch.put(COUNT_PROGRESS,countProgress(counted+1));
+    }
+    private void columnAdded(byte[] key){if(cachedColumns>=0)cachedColumns++;else if(countedThrough!=null&&Arrays.compareUnsigned(key,countedThrough)<=0)counted++;}
     public CacheStats cacheStats() {
         try(var files=Files.walk(path)) {
             long size=files.filter(Files::isRegularFile).mapToLong(file->{
@@ -67,10 +102,60 @@ public final class LodDatabase implements AutoCloseable {
             return new CacheStats(size,cachedColumns);
         }catch(IOException e){throw new UncheckedIOException("LOD cache size failed",e);}
     }
-    public synchronized void importColumn(byte[] key,byte[] value) {
-        boolean absent=get(key)==null;
-        put(key,value);
-        if(absent)cachedColumns++;
+    public synchronized void importColumn(byte[] key,byte[] value,long version,int mask) {
+        storeColumn(key,value,version,mask);
+    }
+
+    /** Region-major metadata keys make a directory one contiguous RocksDB range. */
+    private static byte[] metadataKey(byte[] column){
+        int end=column.length-8;long pos=ByteBuffer.wrap(column,end,8).getLong();int x=(int)pos,z=(int)(pos>>>32);
+        return ByteBuffer.allocate(end+10).put((byte)5).put(column,1,end-1).putInt(x>>5).putInt(z>>5).putShort((short)((x&31)|((z&31)<<5))).array();
+    }
+    private static byte[] regionKey(String dimension,int rx,int rz,int kind){
+        byte[] name=dimension.getBytes(StandardCharsets.UTF_8);
+        return ByteBuffer.allocate(name.length+10).put((byte)kind).put(name).put((byte)0).putInt(rx).putInt(rz).array();
+    }
+    public synchronized Metadata metadata(byte[] column){
+        byte[] existing=get(metadataKey(column));if(existing!=null)return Metadata.decode(existing);
+        Metadata result=legacyMetadata(column);put(metadataKey(column),result.encode());return result;
+    }
+    private Metadata legacyMetadata(byte[] column){
+        byte[] stored=get(column),invalid=get(keyWithKind(column,2));long revision=invalid==null?0:ByteBuffer.wrap(invalid).getLong();
+        if(stored==null)return new Metadata(0,revision,0);
+        try{
+            byte[] header;
+            if(stored[0]!=0)try(var stream=new ZstdInputStreamNoFinalizer(new ByteArrayInputStream(stored,5,stored.length-5))){header=stream.readNBytes(25);}
+            else header=Arrays.copyOfRange(stored,5,30);
+            if(header.length!=25)throw new IllegalArgumentException("Truncated LOD header");
+            var b=ByteBuffer.wrap(header);if(b.getInt()!=1)throw new IllegalArgumentException("Unknown LOD schema");
+            return new Metadata(b.getLong(16),revision,b.get(24)&31);
+        }catch(IOException e){throw new UncheckedIOException("LOD header read failed",e);}
+    }
+    /** Persist migration progress; a region takes at most 64 legacy header reads per turn. */
+    public synchronized boolean prepareRegion(String dimension,int rx,int rz){
+        byte[] progressKey=regionKey(dimension,rx,rz,6),progress=get(progressKey);int start=progress==null?0:ByteBuffer.wrap(progress).getInt();
+        if(start==1024)return true;
+        int end=Math.min(1024,start+64);
+        try(var batch=new WriteBatch()){
+            for(int i=start;i<end;i++){
+                int x=rx*32+(i&31),z=rz*32+(i>>5);byte[] column=key(dimension,(x&0xffffffffL)|((long)z<<32),1),meta=metadataKey(column);
+                if(db.get(meta)==null)batch.put(meta,legacyMetadata(column).encode());
+            }
+            batch.put(progressKey,ByteBuffer.allocate(4).putInt(end).array());db.write(writes,batch);
+        }catch(RocksDBException e){throw new IllegalStateException("LOD directory migration failed",e);}
+        return end==1024;
+    }
+    public synchronized Metadata[] region(String dimension,int rx,int rz){
+        var result=new Metadata[1024];byte[] prefix=regionKey(dimension,rx,rz,5);
+        try(var iterator=db.newIterator()){
+            iterator.seek(prefix);
+            while(iterator.isValid()){
+                byte[] key=iterator.key();if(key.length!=prefix.length+2||!Arrays.equals(prefix,Arrays.copyOf(key,prefix.length)))break;
+                result[Short.toUnsignedInt(ByteBuffer.wrap(key,key.length-2,2).getShort())]=Metadata.decode(iterator.value());iterator.next();
+            }
+            iterator.status();
+        }catch(RocksDBException e){throw new IllegalStateException("LOD directory read failed",e);}
+        return result;
     }
     public void batch(Map<byte[], byte[]> entries) {
         long started=DebugLog.start(),size=0;boolean success=false;
@@ -112,7 +197,10 @@ public final class LodDatabase implements AutoCloseable {
     }
     public synchronized void invalidationsAndMissing(Map<byte[],byte[]> entries, Collection<byte[]> checks) {
         try (var batch=new WriteBatch()) {
-            for(var entry:entries.entrySet())batch.put(entry.getKey(),entry.getValue());
+            for(var entry:entries.entrySet()){
+                byte[] key=entry.getKey();batch.put(key,entry.getValue());
+                if(key[0]==2){byte[] metaKey=metadataKey(key),meta=db.get(metaKey);if(meta!=null){var before=Metadata.decode(meta);batch.put(metaKey,new Metadata(before.version,ByteBuffer.wrap(entry.getValue()).getLong(),before.mask).encode());}}
+            }
             for(byte[] key:checks)if(db.get(key)==null&&db.get(keyWithKind(key,3))==null
                     &&db.get(keyWithKind(key,1))==null)batch.put(key,pendingValue(0,0));
             db.write(writes,batch);
@@ -132,27 +220,23 @@ public final class LodDatabase implements AutoCloseable {
             db.write(writes, batch);
         } catch (RocksDBException e) { throw new IllegalStateException("LOD pending completion failed", e); }
     }
-    public synchronized boolean storeColumn(byte[] key, byte[] value, long version) {
+    public synchronized boolean storeColumn(byte[] key, byte[] value, long version,int mask) {
         try (var batch = new WriteBatch()) {
             byte[] invalid=db.get(keyWithKind(key,2));
             if(invalid!=null && ByteBuffer.wrap(invalid).getLong()>version)return false;
             byte[] stored=db.get(key);
-            if(stored!=null && storedVersion(stored)>version)return false;
+            if(stored!=null && metadata(key).version()>version)return false;
             batch.put(key, value);
+            batch.put(metadataKey(key),new Metadata(version,invalid==null?0:ByteBuffer.wrap(invalid).getLong(),mask).encode());
+            if(stored==null)addColumn(batch,key);
             for (int kind = 3; kind <= 4; kind++) {
                 byte[] pendingKey = keyWithKind(key, kind), pending = db.get(pendingKey);
                 if (pending != null && ByteBuffer.wrap(pending).getLong() <= version) batch.delete(pendingKey);
             }
             db.write(writes, batch);
-            if(stored==null)cachedColumns++;
+            if(stored==null)columnAdded(key);
             return true;
         } catch (RocksDBException e) { throw new IllegalStateException("LOD column write failed", e); }
-    }
-    private static long storedVersion(byte[] stored) {
-        var header = ByteBuffer.wrap(ColumnCodec.uncompress(unpack(stored)));
-        if (header.getInt() != 1) throw new IllegalArgumentException("Unknown LOD schema");
-        // Schema, x, z and minY occupy the first four ints.
-        return header.getLong(16);
     }
     private static byte[] keyWithKind(byte[] key, int kind) {
         byte[] result = key.clone(); result[0] = (byte)kind; return result;

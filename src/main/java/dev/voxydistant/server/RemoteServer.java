@@ -223,7 +223,7 @@ public final class RemoteServer {
         });
         var path=server.getWorldPath(LevelResource.ROOT).resolve("data/voxy-distant");
         workers.execute(() -> {
-            try { var db=new LodDatabase(path,DistantConfig.SERVER_CACHE_MIB.get()*1048576L); UUID id=db.worldId();db.countCachedColumns();database=db; complete(() -> { world=id;for(Session s:players.values())hello(s.player); }); }
+            try { var db=new LodDatabase(path,DistantConfig.SERVER_CACHE_MIB.get()*1048576L); UUID id=db.worldId();database=db; complete(() -> { world=id;for(Session s:players.values())hello(s.player); }); }
             catch (RuntimeException e) { complete(() -> fail(e)); }
         });
     }
@@ -641,12 +641,32 @@ public final class RemoteServer {
             long queued=DebugLog.start();
             workers.execute(() -> {
                 DebugLog.end(SERVER_WORKER_QUEUE,queued);
+                try{
+                    var meta=database.metadata(key.key(1));
+                    complete(()->{
+                        if(work.get(key)!=w)return;
+                        long latest=Math.max(meta.invalid(),versions.getOrDefault(key,0L));
+                        if(meta.mask()!=0&&meta.version()>=latest){
+                            for(var it=w.demands.iterator();it.hasNext();){var d=it.next();var p=d.session.player.chunkPosition();int level=bands.select(key.x,key.z,p.x,p.z);
+                                if((meta.mask()&(1<<level))!=0&&d.want.version()==meta.version()&&d.want.level()<=level){reply(d.session,d.want,0);it.remove();detach(w,d);}
+                            }
+                        }
+                        if(w.demands.isEmpty()&&w.maintenance==null&&w.backgroundKind==0){hits++;finish(w,-1);return;}
+                        readCachedColumn(w,limits,cacheMask,meta);
+                    });
+                }catch(RuntimeException e){complete(()->{fail(e);finish(w,1);});}
+            });
+        }
+    }
+    private void readCachedColumn(Work w,DistantConfig.Limits limits,int cacheMask,LodDatabase.Metadata meta){
+        Key key=w.key;
+        workers.execute(()->{
                 long timing=DebugLog.start();try {
-                    byte[] invalid=database.get(key.key(2)), stored=database.get(key.key(1));
+                    byte[] stored=meta.current()?database.get(key.key(1)):null;
                     long readNanos=timing==0?0:System.nanoTime()-timing,decode=DebugLog.start();
                     LodColumn column=stored==null?null:ColumnCodec.decodeLevels(LodDatabase.unpack(stored),cacheMask);
                     long decodeNanos=DebugLog.end(SERVER_CACHE_DECODE,decode);
-                    long revision=invalid==null?0:ByteBuffer.wrap(invalid).getLong();
+                    long revision=meta.invalid();
                     DebugLog.end(SERVER_CACHE,timing);long ready=DebugLog.start();
                     complete(() -> {
                         DebugLog.end(SERVER_COMPLETION,ready);
@@ -671,7 +691,6 @@ public final class RemoteServer {
                     });
                 } catch(RuntimeException e) { complete(() -> { fail(e); finish(w,1); }); }
             });
-        }
     }
     private void attach(Work w,Demand d){
         w.demands.add(d);d.session.active++;
@@ -775,7 +794,7 @@ public final class RemoteServer {
                 long conversion=DebugLog.start();
                 var column = ColumnConverter.convert(w.key.x, w.key.z, w.version, w.snapshots);
                 DebugLog.end(SERVER_CONVERT,conversion);
-                boolean stored=database.storeColumn(w.key.key(1), LodDatabase.pack(ColumnCodec.encode(column, 31)),column.version());
+                boolean stored=database.storeColumn(w.key.key(1), LodDatabase.pack(ColumnCodec.encode(column, 31)),column.version(),31);
                 double duty = DistantConfig.serverLimits().dutyCycle();
                 if (duty < 1) {long pacing=DebugLog.start();LockSupport.parkNanos((long) ((System.nanoTime() - start) * (1 / duty - 1)));DebugLog.end(SERVER_PACE,pacing);}
                 complete(() -> {
@@ -1164,9 +1183,21 @@ public final class RemoteServer {
         self.workers.execute(()->{
             try {
                 var db=self.database;
+                self.startCacheCount(db);
                 var stats=db.cacheStats();
                 self.server.execute(()->{if(!self.stopping&&player.connection.isAcceptingMessages())Protocol.send(player,new Protocol.CacheStats(stats.bytes(),stats.columns()));});
             }catch(RuntimeException ex){self.server.execute(()->self.fail(ex));}
+        });
+    }
+    private final java.util.concurrent.atomic.AtomicBoolean countingCache=new java.util.concurrent.atomic.AtomicBoolean();
+    private void startCacheCount(LodDatabase db){
+        if(!countingCache.compareAndSet(false,true))return;
+        countCacheStep(db);
+    }
+    private void countCacheStep(LodDatabase db){
+        workers.execute(()->{
+            try{boolean done=db.countCachedColumnsStep();server.execute(()->{if(done||stopping||database!=db)countingCache.set(false);else countCacheStep(db);});}
+            catch(RuntimeException ex){countingCache.set(false);server.execute(()->fail(ex));}
         });
     }
     private void applyConfiguration(ServerSettings.Snapshot next,java.util.function.BooleanSupplier allowed,java.util.function.Consumer<String> done) {
@@ -1204,7 +1235,6 @@ public final class RemoteServer {
             finally{database=null;}
         }
         database=new LodDatabase(server.getWorldPath(LevelResource.ROOT).resolve("data/voxy-distant"),mib*1048576L);
-        database.countCachedColumns();
         database.sync();importStorageFailed=false;failure="";
     }
     private void finishConfigChange(String error) {
@@ -1336,7 +1366,7 @@ public final class RemoteServer {
                     task.convertNanos.add(System.nanoTime()-start);start=System.nanoTime();
                     byte[] encoded=LodDatabase.pack(ColumnCodec.encode(column,31));
                     task.encodeNanos.add(System.nanoTime()-start);start=System.nanoTime();
-                    try{database.importColumn(entry.key.key(1),encoded);}
+                    try{database.importColumn(entry.key.key(1),encoded,task.version,31);}
                     catch(RuntimeException ex){importStorageFailed=true;throw ex;}
                     versions.computeIfPresent(entry.key,(key,revision)->Math.max(revision,task.version));
                     task.writeNanos.add(System.nanoTime()-start);task.completed();

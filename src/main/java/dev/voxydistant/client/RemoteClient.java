@@ -232,7 +232,7 @@ public final class RemoteClient {
     public static String cacheStatus() {
         if(cacheConnection==null)return "服务器缓存：未连接";
         if(!Protocol.CHANNEL.isRemotePresent(cacheConnection))return "服务器缓存：未安装兼容扩展";
-        return cacheColumns<0?"服务器缓存：查询中…":String.format(Locale.ROOT,"服务器缓存 %.1f MiB · %,d 列",cacheBytes/1048576.0,cacheColumns);
+        return cacheColumns<0?(cacheBytes<0?"服务器缓存：查询中…":String.format(Locale.ROOT,"服务器缓存 %.1f MiB · 列数统计中…",cacheBytes/1048576.0)):String.format(Locale.ROOT,"服务器缓存 %.1f MiB · %,d 列",cacheBytes/1048576.0,cacheColumns);
     }
     public static String receiveSpeed() {
         Session s=session;
