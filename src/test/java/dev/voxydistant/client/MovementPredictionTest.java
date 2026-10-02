@@ -9,12 +9,12 @@ class MovementPredictionTest {
         var tracker=new MovementPrediction();var world=new Object();var config=new MovementPrediction.Settings(true,2.15,22,.5);
         tracker.sample(world,0,0,false,config);
         for(int i=1;i<=5;i++){tracker.sample(world,i*1.1,0,false,config);assertEquals(0,tracker.snapshot().amount());}
-        for(int i=6;i<=11;i++)tracker.sample(world,i*1.1,0,false,config);
+        for(int i=6;i<=15;i++)tracker.sample(world,i*1.1,0,false,config);
         assertEquals(1,tracker.snapshot().amount(),1e-9);
-        double x=12.1;
-        tracker.sample(world,x+2.2,0,false,config);
-        assertEquals((x+2.2+22)/16,tracker.snapshot().centerX(),1e-9);
-        for(int i=0;i<6;i++)tracker.sample(world,x+2.2,0,false,config);
+        double x=16.5;
+        for(int i=0;i<4;i++)tracker.sample(world,x+=2.2,0,false,config);
+        assertEquals((x+22)/16,tracker.snapshot().centerX(),1e-9);
+        for(int i=0;i<10;i++)tracker.sample(world,x,0,false,config);
         assertEquals(0,tracker.snapshot().amount());
         tracker.sample(new Object(),2000,0,false,config);assertEquals(0,tracker.snapshot().speed());
     }

@@ -115,12 +115,13 @@ public final class ServerSmoke {
                 var db=(LodDatabase)field(service,"database");var stored=ColumnCodec.decode(LodDatabase.unpack(db.get(LodDatabase.key("minecraft:overworld",net.minecraft.world.level.ChunkPos.asLong(40,40),1))));check(stored.mask()==31,"server stores all levels");
                 // Both players request the same cached column, but now require different levels.
                 peers.getLast().player.setPos(640,100,640);
-                for(var p:peers)RemoteServer.requests(p.player,new Protocol.Requests(1,96,2,0,32<<20,List.of(new Protocol.Want(40,40,0,5))));
+                for(var p:peers)RemoteServer.requests(p.player,new Protocol.Requests(1,96,2,0,32<<20,List.of(new Protocol.Want(40,40,0,5,0,p==peers.getLast()?3:0))));
                 stage=5;
             }
             if(stage==5&&peers.stream().allMatch(p->p.columns.size()>=2)){
                 check(peers.getFirst().columns.getLast().mask()==2,"cached distant player receives L1");
-                check(peers.getLast().columns.getLast().mask()==1,"shared cached nearby player receives L0");
+                if(peers.getLast().columns.stream().noneMatch(c->c.mask()==8))return;
+                check(peers.getLast().columns.stream().anyMatch(c->c.mask()==8),"client can request coarser L3 inside server L0 band");
                 check(peers.stream().allMatch(p->p.columns.getLast().version()==oldVersion),"cached players share revision");
                 check(((Long)field(service,"completed"))==1,"cached different levels do not regenerate");
                 peers.getLast().player.setPos(0,100,0);
@@ -169,10 +170,12 @@ public final class ServerSmoke {
                     var sessions=(Map<UUID,Object>)field(service,"players");var session=sessions.get(peer.player.getUUID());
                     for(int i=0;i<=Protocol.MAX_REGION_QUERIES;i++)RemoteServer.regionQuery(peer.player,new Protocol.RegionQuery(1,70001+i,1,1));
                     check(((Map<?,?>)field(session,"directories")).size()+((Deque<?>)field(session,"directoryReplies")).size()==32,"server accepts 32 region queries and bounds overflow");
+                    RemoteServer.regionCancel(peer.player,new Protocol.RegionCancel(1,List.of(70032L)));
+                    RemoteServer.regionQuery(peer.player,new Protocol.RegionQuery(1,70034,1,1));
                     regionTestStarted=true;return;
                 }
                 if(peer.summaries.size()<Protocol.MAX_REGION_QUERIES)return;
-                check(peer.summaries.size()==32&&peer.summaries.stream().noneMatch(summary->summary.id()==70033),"region query window completes without overflow reply");
+                check(peer.summaries.size()==32&&peer.summaries.stream().noneMatch(summary->summary.id()==70033||summary.id()==70032),"region query cancel frees window and suppresses cancelled reply");
                 var summary=peer.summaries.stream().filter(reply->reply.id()==70001).findFirst().orElseThrow();check(summary.epoch()==1&&summary.x()==1&&summary.z()==1,"region query lifecycle");
                 int slot=(40&31)|((40&31)<<5);check(summary.versions()[slot]>=oldVersion,"region metadata includes cached revision");
                 System.out.println("DISTANT_REGION_DIRECTORY_PASS: config range 1-32, 32 queries complete, overflow bounded, migration, summary round trip, revision and transport budget");

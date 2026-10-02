@@ -4,6 +4,7 @@ import dev.voxydistant.client.RemoteClient;
 import dev.voxydistant.DebugLog;
 import dev.voxydistant.server.RemoteServer;
 import dev.voxydistant.data.ColumnCodec;
+import dev.voxydistant.movement.RequestShape;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
@@ -24,17 +25,19 @@ public final class Protocol {
         return total+raw*3L+scratch;
     }
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(new ResourceLocation("voxy_distant", "lod"),
-            () -> "16", Protocol::compatible, Protocol::compatible);
+            () -> "17", Protocol::compatible, Protocol::compatible);
     private static boolean compatible(String version) {
-        return version.equals("16") || version.equals(NetworkRegistry.ABSENT) || version.equals(NetworkRegistry.ACCEPTVANILLA);
+        return version.equals("17") || version.equals(NetworkRegistry.ABSENT) || version.equals(NetworkRegistry.ACCEPTVANILLA);
     }
     public record Hello(UUID world,String dimension, int radius, int minY, int maxY, List<String> bands) {}
     public record Maintenance(boolean paused) {}
-    public record Want(int x, int z, long version, int level, long requestId) {
+    public record Want(int x, int z, long version, int level, long requestId,int desired) {
+        public Want(int x,int z,long version,int level,long requestId){this(x,z,version,level,requestId,0);}
         public Want(int x,int z,long version,int level){this(x,z,version,level,0);}
     }
     public record Cancel(int x,int z,long requestId) {}
-    public record Requests(int epoch, int radius, int view, int bandwidth, int capacity, List<Want> wants,List<Cancel> cancels) {
+    public record Requests(int epoch, int radius, int view, int bandwidth, int capacity, List<Want> wants,List<Cancel> cancels,RequestShape shape) {
+        public Requests(int epoch,int radius,int view,int bandwidth,int capacity,List<Want> wants,List<Cancel> cancels){this(epoch,radius,view,bandwidth,capacity,wants,cancels,null);}
         public Requests(int epoch,int radius,int view,int bandwidth,int capacity,List<Want> wants){this(epoch,radius,view,bandwidth,capacity,wants,List.of());}
     }
     public record Fragment(int epoch, long transfer, int x, int z, long version, int level, long requestId, boolean compressed,
@@ -55,8 +58,10 @@ public final class Protocol {
     public record CacheStats(long bytes,long columns) {}
     public record RegionQuery(int epoch,long id,int x,int z) {}
     public record RegionSummary(int epoch,long id,int x,int z,long[] versions,byte[] masks) {}
+    public record RegionCancel(int epoch,List<Long> ids) {}
 
     public static void register() {
+        CHANNEL.registerMessage(15,RegionCancel.class,(m,b)->{b.writeInt(m.epoch);b.writeVarInt(m.ids.size());m.ids.forEach(b::writeLong);},b->{int epoch=b.readInt(),count=ColumnCodec.bounded(b.readVarInt(),0,MAX_REGION_QUERIES);var ids=new ArrayList<Long>();for(int i=0;i<count;i++)ids.add(b.readLong());return new RegionCancel(epoch,List.copyOf(ids));},(m,c)->{var ctx=c.get();ctx.enqueueWork(()->RemoteServer.regionCancel(ctx.getSender(),m));ctx.setPacketHandled(true);},Optional.of(NetworkDirection.PLAY_TO_SERVER));
         CHANNEL.registerMessage(13,RegionQuery.class,(m,b)->{b.writeInt(m.epoch);b.writeLong(m.id);b.writeInt(m.x);b.writeInt(m.z);},
                 b->new RegionQuery(b.readInt(),b.readLong(),b.readInt(),b.readInt()),(m,c)->{var ctx=c.get();ctx.enqueueWork(()->RemoteServer.regionQuery(ctx.getSender(),m));ctx.setPacketHandled(true);},Optional.of(NetworkDirection.PLAY_TO_SERVER));
         CHANNEL.registerMessage(14,RegionSummary.class,Protocol::writeRegion,Protocol::readRegion,
@@ -73,15 +78,17 @@ public final class Protocol {
         }, (m,c) -> client(c, () -> RemoteClient.hello(m)), Optional.of(NetworkDirection.PLAY_TO_CLIENT));
         CHANNEL.registerMessage(1, Requests.class, (m,b) -> {
             b.writeInt(m.epoch); b.writeVarInt(m.radius); b.writeVarInt(m.view); b.writeVarInt(m.bandwidth); b.writeVarInt(m.capacity);
-            b.writeVarInt(m.wants.size()); for (var w : m.wants) { b.writeInt(w.x); b.writeInt(w.z); b.writeLong(w.version); b.writeByte(w.level); b.writeLong(w.requestId); }
+            b.writeVarInt(m.wants.size()); for (var w : m.wants) { b.writeInt(w.x); b.writeInt(w.z); b.writeLong(w.version); b.writeByte(w.level); b.writeLong(w.requestId);b.writeByte(w.desired); }
             b.writeVarInt(m.cancels.size()); for(var cancel:m.cancels){b.writeInt(cancel.x);b.writeInt(cancel.z);b.writeLong(cancel.requestId);}
+            b.writeBoolean(m.shape!=null);if(m.shape!=null){b.writeDouble(m.shape.centerX());b.writeDouble(m.shape.centerZ());b.writeDouble(m.shape.directionX());b.writeDouble(m.shape.directionZ());b.writeDouble(m.shape.amount());}
         }, b -> {
             int epoch = b.readInt(), radius = b.readVarInt(), view = b.readVarInt(), bandwidth = b.readVarInt(), capacity = b.readVarInt();
             int count = ColumnCodec.bounded(b.readVarInt(), 0, 64); var wants = new ArrayList<Want>(count);
-            for (int i = 0; i < count; i++) wants.add(new Want(b.readInt(), b.readInt(), b.readLong(), b.readUnsignedByte(),b.readLong()));
+            for (int i = 0; i < count; i++) wants.add(new Want(b.readInt(), b.readInt(), b.readLong(), b.readUnsignedByte(),b.readLong(),ColumnCodec.bounded(b.readUnsignedByte(),0,4)));
             int cancelled=ColumnCodec.bounded(b.readVarInt(),0,16);var cancels=new ArrayList<Cancel>(cancelled);
             for(int i=0;i<cancelled;i++)cancels.add(new Cancel(b.readInt(),b.readInt(),b.readLong()));
-            return new Requests(epoch, radius, view, bandwidth, capacity, List.copyOf(wants),List.copyOf(cancels));
+            RequestShape shape=null;if(b.readBoolean()){double x=b.readDouble(),z=b.readDouble(),dx=b.readDouble(),dz=b.readDouble(),amount=b.readDouble();if(!Double.isFinite(x)||!Double.isFinite(z)||Math.abs(x)>1875000||Math.abs(z)>1875000||!Double.isFinite(dx)||!Double.isFinite(dz)||Math.abs(dx*dx+dz*dz-1)>1e-6||!Double.isFinite(amount)||amount<0||amount>1)throw new IllegalArgumentException("Invalid request shape");shape=new RequestShape(0,0,x,z,dx,dz,amount,radius,radius);}
+            return new Requests(epoch, radius, view, bandwidth, capacity, List.copyOf(wants),List.copyOf(cancels),shape);
         }, (m,c) -> { var ctx=c.get(); long queued=DebugLog.start();ctx.enqueueWork(() -> {DebugLog.end(DebugLog.Metric.SERVER_REQUEST_CONTROL,queued);RemoteServer.requests(ctx.getSender(),m);}); ctx.setPacketHandled(true); }, Optional.of(NetworkDirection.PLAY_TO_SERVER));
         CHANNEL.registerMessage(2, Fragment.class, (m,b) -> {
             b.writeInt(m.epoch); b.writeLong(m.transfer); b.writeInt(m.x); b.writeInt(m.z); b.writeLong(m.version); b.writeByte(m.level);

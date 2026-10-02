@@ -196,6 +196,7 @@ public final class RemoteServer {
         final Map<Long,Map<Integer,Long>> directoryChanges=new HashMap<>();
         final ArrayDeque<Protocol.RegionSummary> directoryReplies=new ArrayDeque<>();
         boolean directoryReading;
+        dev.voxydistant.movement.RequestShape shape;
         final ServerPlayer player; final LinkedHashMap<Long, Protocol.Want> pending = new LinkedHashMap<>();
         final ArrayDeque<Transfer> send = new ArrayDeque<>(); final Map<Long,Credit> inflight = new HashMap<>();
         final LinkedHashMap<Long,Ready> ready=new LinkedHashMap<>();
@@ -284,6 +285,7 @@ public final class RemoteServer {
             s.epoch=r.epoch(); s.active=0;
         }
         s.radius=Math.min(r.radius(),DistantConfig.SERVER_RADIUS.get()); s.view=Math.min(r.view(),server.getPlayerList().getViewDistance());
+        s.shape=r.shape();
         s.bandwidth=r.bandwidth();s.advertisedCapacity=r.capacity();s.capacity=creditLimit(s);
         for(var cancel:r.cancels())cancel(s,cancel);
         if (s.requestTick!=ticks) { s.requestTick=ticks; s.requestsThisTick=0; }
@@ -295,6 +297,7 @@ public final class RemoteServer {
         int pending=-1;
         for (var want:r.wants()) {
             ColumnCodec.bounded(want.level(),0,5);
+            ColumnCodec.bounded(want.desired(),0,4);
             if(DebugLog.verbose())DebugLog.log("SERVER want player={} epoch={} x={} z={} request_id={} version={} level={}",player.getUUID(),s.epoch,want.x(),want.z(),want.requestId(),want.version(),want.level());
             if(s.requestsThisTick>=requestLimit){s.blocked("request_rate");reply(s,want,1,"request_rate");continue;}
             s.requestsThisTick++;
@@ -623,7 +626,7 @@ public final class RemoteServer {
             if(s.reserved>=s.capacity){s.blocked("credit");continue;}
             var want=s.pending.values().iterator().next();
             // Aging turns eventually win; until then, movement reprioritizes near requests.
-            if(ticks%20!=0){var p=s.player.chunkPosition();long best=Long.MAX_VALUE;for(var candidate:s.pending.values()){long dx=(long)candidate.x()-p.x,dz=(long)candidate.z()-p.z;long distance=dx*dx+dz*dz;if(distance<best){best=distance;want=candidate;}}}
+            if(ticks%20!=0){double best=Double.POSITIVE_INFINITY;for(var candidate:s.pending.values()){double distance=priority(s,candidate.x(),candidate.z());if(distance<best){best=distance;want=candidate;}}}
             s.pending.remove(ChunkPos.asLong(want.x(),want.z()));
             if(!inRange(s,want.x(),want.z())) { reply(s,want,2,"out_of_range");s.latestRequestIds.remove(ChunkPos.asLong(want.x(),want.z()),want.requestId());idle=0;continue; }
             Key key=new Key(s.dimension,want.x(),want.z()); Work existing=work.get(key);
@@ -646,7 +649,7 @@ public final class RemoteServer {
             attach(w,new Demand(s,want));work.put(key,w);cacheTokens--;
             // Freeze the levels needed by current readers; later demands can read again if needed.
             var bands=DistanceBands.parse(DistantConfig.BANDS.get());
-            for(Demand d:w.demands){var p=d.session.player.chunkPosition();w.cacheMask|=1<<bands.select(key.x,key.z,p.x,p.z);}
+            for(Demand d:w.demands){var p=d.session.player.chunkPosition();w.cacheMask|=1<<Math.max(d.want.desired(),bands.select(key.x,key.z,p.x,p.z));}
             final int cacheMask=w.cacheMask;
             long queued=DebugLog.start();
             workers.execute(() -> {
@@ -657,7 +660,7 @@ public final class RemoteServer {
                         if(work.get(key)!=w)return;
                         long latest=Math.max(meta.invalid(),versions.getOrDefault(key,0L));
                         if(meta.mask()!=0&&meta.version()>=latest){
-                            for(var it=w.demands.iterator();it.hasNext();){var d=it.next();var p=d.session.player.chunkPosition();int level=bands.select(key.x,key.z,p.x,p.z);
+                            for(var it=w.demands.iterator();it.hasNext();){var d=it.next();var p=d.session.player.chunkPosition();int level=Math.max(d.want.desired(),bands.select(key.x,key.z,p.x,p.z));
                                 if((meta.mask()&(1<<level))!=0&&d.want.version()==meta.version()&&d.want.level()<=level){reply(d.session,d.want,0);it.remove();detach(w,d);}
                             }
                         }
@@ -677,6 +680,10 @@ public final class RemoteServer {
         s.directories.put(query.id(),query);self.schedule(DistantConfig.serverLimits());
     }
     private int directoryCursor;
+    public static void regionCancel(ServerPlayer player,Protocol.RegionCancel cancel){
+        var self=instance;if(self==null)return;var s=self.players.get(player.getUUID());if(s==null||s.epoch!=cancel.epoch())return;
+        for(long id:cancel.ids()){s.directories.remove(id);s.directoryChanges.remove(id);for(var it=s.directoryReplies.iterator();it.hasNext();)if(it.next().id()==id){it.remove();s.bytes-=16384;}}
+    }
     private void scheduleDirectories(DistantConfig.Limits limits){
         var sessions=new ArrayList<>(players.values());
         if(cacheActive>=Math.max(1,limits.concurrency()/2))return;
@@ -865,7 +872,7 @@ public final class RemoteServer {
         w.stage=3;var bands=DistanceBands.parse(DistantConfig.BANDS.get());
         var recipients=new HashMap<Integer,List<Demand>>();
         for(Demand d:w.demands) {
-            var p=d.session.player.chunkPosition();int level=bands.select(w.key.x,w.key.z,p.x,p.z);
+            var p=d.session.player.chunkPosition();int level=Math.max(d.want.desired(),bands.select(w.key.x,w.key.z,p.x,p.z));
             if((column.mask()&(1<<level))==0){
                 if(w.cacheMask!=0&&(w.cacheMask&(1<<level))==0){
                     // The player joined or moved after the read started; keep the same request ID.
@@ -978,7 +985,8 @@ public final class RemoteServer {
         var members=new ArrayList<Protocol.Member>();var columns=new ArrayList<byte[]>();
         var candidates=new ArrayList<>(s.ready.values());var center=s.player.chunkPosition();
         boolean age=ticks-s.lastReadyAgedTick>=20;
-        candidates.sort(Comparator.comparingLong((Ready r)->distance(center,r.member().x(),r.member().z()))
+        candidates.sort(Comparator.comparingDouble((Ready r)->priority(s,r.member().x(),r.member().z()))
+                .thenComparingLong(r->distance(center,r.member().x(),r.member().z()))
                 .thenComparingInt(Ready::tick));
         if(age){var oldest=s.ready.firstEntry().getValue();candidates.remove(oldest);candidates.addFirst(oldest);}
         for(Ready r:candidates){
@@ -1144,13 +1152,14 @@ public final class RemoteServer {
     }
     private int creditLimit(Session s){return Math.min(s.advertisedCapacity,(int)Math.min(Integer.MAX_VALUE,DistantConfig.PLAYER_SEND_MIB.get()*1048576L*4));}
     private static long distance(ChunkPos center,int x,int z){long dx=(long)x-center.x,dz=(long)z-center.z;return dx*dx+dz*dz;}
+    private static double priority(Session s,int x,int z){return s.shape==null?distance(s.player.chunkPosition(),x,z):s.shape.score(x,z);}
     private void selectTransfer(Session s){
         Transfer head=s.send.peek();if(head==null||head.offset!=0)return;
-        Transfer chosen=head;boolean age=ticks-s.lastSendAgedTick>=20;long best=Long.MAX_VALUE;var center=s.player.chunkPosition();
+        Transfer chosen=head;boolean age=ticks-s.lastSendAgedTick>=20;double best=Double.POSITIVE_INFINITY;
         for(var candidate:s.send){
             if(age){if(candidate.created<chosen.created)chosen=candidate;}
-            else {long nearest=Long.MAX_VALUE;if(candidate.members.isEmpty())nearest=distance(center,candidate.key.x,candidate.key.z);
-                else for(var m:candidate.members)nearest=Math.min(nearest,distance(center,m.x(),m.z()));
+            else {double nearest=Double.POSITIVE_INFINITY;if(candidate.members.isEmpty())nearest=priority(s,candidate.key.x,candidate.key.z);
+                else for(var m:candidate.members)nearest=Math.min(nearest,priority(s,m.x(),m.z()));
                 if(nearest<best){best=nearest;chosen=candidate;}}
         }
         if(age)s.lastSendAgedTick=ticks;

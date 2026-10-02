@@ -9,6 +9,19 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 class RegionDiscoveryTest {
+    @org.junit.jupiter.api.Test void predictionMasksMatchReferenceAndStopRechecking(){
+        var bands=dev.voxydistant.config.DistanceBands.parse(java.util.List.of("32:0","64:1","96:2"));
+        for(int heading=0;heading<8;heading++){
+            double angle=heading*Math.PI/4;var shape=new dev.voxydistant.movement.RequestShape(-3,-9,-2,-8,Math.cos(angle),Math.sin(angle),1,96,128);
+            var discovery=new RegionDiscovery(bands);discovery.move(shape);
+            for(var r:discovery.regions.values())discovery.applyMasks(r,shape,discovery.buildMasks(r,shape));
+            for(int z=-140;z<140;z++)for(int x=-140;x<140;x++){
+                var r=discovery.regions.get(RegionDiscovery.key(x>>5,z>>5));int slot=(x&31)|((z&31)<<5),actual=5;
+                if(r!=null)for(int l=0;l<5;l++)if(r.targets[l].get(slot))actual=l;
+                assertEquals(shape.contains(x,z)?shape.desired(bands,x,z):5,actual,"heading="+heading+" x="+x+" z="+z);
+            }
+        }
+    }
     @TempDir Path path;
     @Test void movementMatchesExactDistanceBandsAndDoesNotRecheckInterior(){
         var bands=DistanceBands.parse(List.of("32:0","64:1","96:2"));

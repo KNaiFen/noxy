@@ -111,6 +111,8 @@ public final class RemoteClient {
         boolean activePending;int activeX,activeZ,activeRadius;
         final DistanceBands bands;volatile int epoch=++sequence;volatile boolean closed;
         final RegionDiscovery discovery;
+        dev.voxydistant.movement.RequestShape shape;
+        long movementRevision=-1;
         final Map<Long,RegionRequest> regionQueries=new LinkedHashMap<>();
         boolean preparingDirectory;int directoryTick=-1;
         int x=Integer.MIN_VALUE,z,radius,requestedRadius,view,ticks,generation,requestBudget,preempted,indexMiB=DistantConfig.INDEX_MIB.get(),lastPressureTick=-200;volatile long applied,received;long requestSequence,regionSequence;
@@ -196,6 +198,7 @@ public final class RemoteClient {
         boolean indexChanged=s.indexMiB!=indexMiB;
         if(indexChanged){VoxyBridge.coverage(s.engine).remote(s.hello.minY(),s.hello.maxY(),indexMiB);s.indexMiB=indexMiB;}
         var coverage=VoxyBridge.coverage(s.engine);
+        var motion=dev.voxydistant.movement.MovementPrediction.CLIENT.snapshot();
         boolean pressure=coverage.pressure();
         if(pressure)s.lastPressureTick=s.ticks;
         int radius=pressure?coverage.stepDown(requested,x,z)
@@ -203,13 +206,18 @@ public final class RemoteClient {
                 ?coverage.limitRadius(requested,x,z):s.radius;
         s.requestedRadius=requested;
         if(radius<requested&&s.ticks%100==0)mc.gui.setOverlayMessage(net.minecraft.network.chat.Component.literal("索引预算不足：实际远景 "+radius+" / "+requested+" 区块；详情见 VD 设置"),false);
-        if(s.x!=x||s.z!=z||s.radius!=radius||s.view!=view) {
+        if(s.movementRevision!=motion.revision()||s.x!=x||s.z!=z)radius=Math.min(radius,coverage.limitShape(motion.shape(radius,s.hello.radius()),Math.min(radius,VoxyBridge.radiusChunks())));
+        if(s.x!=x||s.z!=z||s.radius!=radius||s.view!=view||s.movementRevision!=motion.revision()) {
             if(DebugLog.enabled())DebugLog.log("CLIENT move epoch={} from_x={} from_z={} x={} z={} generation={} radius={} view={}",s.epoch,s.x,s.z,x,z,s.generation+1,radius,view);
             boolean teleport=s.x!=Integer.MIN_VALUE&&(Math.abs((long)x-s.x)>32||Math.abs((long)z-s.z)>32);
             s.x=x;s.z=z;s.radius=radius;s.view=view;s.generation++;s.preempted=0;
             if(teleport){s.epoch=++sequence;s.pending.clear();s.checked.clear();s.invalid.clear();s.retries.clear();synchronized(s.assemblies){for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();s.discardedBatches.clear();}}
             if(teleport){s.discovery.reset();s.regionQueries.clear();}
-            s.discovery.move(x,z,radius);
+            s.movementRevision=motion.revision();s.shape=motion.shape(radius,s.hello.radius());s.discovery.move(s.shape);
+            var regionCancels=new ArrayList<Long>();for(var it=s.regionQueries.entrySet().iterator();it.hasNext();){var entry=it.next();var r=entry.getValue().region();if(s.discovery.regions.get(RegionDiscovery.key(r.x,r.z))!=r){regionCancels.add(entry.getKey());it.remove();}}
+            if(!regionCancels.isEmpty())Protocol.CHANNEL.sendToServer(new Protocol.RegionCancel(s.epoch,List.copyOf(regionCancels)));
+            var cancels=new ArrayList<Protocol.Cancel>();for(var entry:s.pending.entrySet()){var request=entry.getValue();long p=entry.getKey();if(!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)))synchronized(request){if(!request.receiving&&!request.applying&&s.pending.remove(p,request))cancels.add(new Protocol.Cancel(ChunkPos.getX(p),ChunkPos.getZ(p),request.id()));}}
+            for(int i=0;i<cancels.size();i+=16)send(s,List.of(),cancels.subList(i,Math.min(i+16,cancels.size())));
             s.checked.keySet().removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
             s.versions.keySet().removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
             s.invalid.removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
@@ -292,18 +300,18 @@ public final class RemoteClient {
         while(s.regionQueries.size()<DistantConfig.REGION_QUERY_WINDOW.get()){var region=s.discovery.nextQuery();if(region==null)break;long id=++s.regionSequence;s.regionQueries.put(id,new RegionRequest(region,now));Protocol.CHANNEL.sendToServer(new Protocol.RegionQuery(s.epoch,id,region.x,region.z));}
         if(s.preparingDirectory||s.directoryTick==s.ticks||s.worker.getQueue().size()>=256)return;
         var tasks=new ArrayList<RegionDiscovery.Region>();
-        for(var r:s.discovery.regions.values())if(r.prepare&&!r.migrate)tasks.add(r);
+        for(var r:s.discovery.regions.values())if(r.maskPending||r.prepare&&!r.migrate)tasks.add(r);
         if(tasks.isEmpty())for(var r:s.discovery.regions.values())if(r.prepare)tasks.add(r);
         if(tasks.isEmpty())return;
-        tasks.sort(Comparator.comparingLong(r->{long dx=(long)r.x*32+16-s.x,dz=(long)r.z*32+16-s.z;return dx*dx+dz*dz;}));
+        tasks.sort(Comparator.comparingLong((RegionDiscovery.Region r)->r.preparedAt).thenComparingDouble(r->s.shape.minimumScore(r.x*32,r.z*32,r.x*32+31,r.z*32+31)));
         if(tasks.size()>8)tasks.subList(8,tasks.size()).clear();
-        s.preparingDirectory=true;s.directoryTick=s.ticks;int epoch=s.epoch;
+        s.preparingDirectory=true;s.directoryTick=s.ticks;int epoch=s.epoch;var footprint=s.shape;
         if(!s.offer(()->{
             try{
-                long started=DebugLog.start(),deadline=System.nanoTime()+2_000_000L;var results=new LinkedHashMap<RegionDiscovery.Region,CoverageStore.Directory>();
-                for(var region:tasks){if(s.closed||s.epoch!=epoch)break;results.put(region,VoxyBridge.coverage(s.engine).directory(region.x,region.z,region.migrate));if(System.nanoTime()>=deadline)break;}
+                long started=DebugLog.start(),deadline=System.nanoTime()+2_000_000L;var results=new LinkedHashMap<RegionDiscovery.Region,CoverageStore.Directory>();var masks=new LinkedHashMap<RegionDiscovery.Region,RegionDiscovery.Masks>();
+                for(var region:tasks){if(s.closed||s.epoch!=epoch)break;if(region.maskPending)masks.put(region,s.discovery.buildMasks(region,footprint));if(region.prepare)results.put(region,VoxyBridge.coverage(s.engine).directory(region.x,region.z,region.migrate));if(System.nanoTime()>=deadline)break;}
                 DebugLog.end(CLIENT_INDEX,started);
-                Minecraft.getInstance().execute(()->{s.preparingDirectory=false;if(session!=s||s.epoch!=epoch)return;results.forEach((region,directory)->{
+                Minecraft.getInstance().execute(()->{s.preparingDirectory=false;if(session!=s||s.epoch!=epoch)return;masks.forEach((region,value)->s.discovery.applyMasks(region,footprint,value));results.forEach((region,directory)->{
                     if(directory!=null)for(int i=0;i<1024;i++){long p=ChunkPos.asLong(region.x*32+(i&31),region.z*32+(i>>5));if(s.versions.getOrDefault(p,0L)>directory.versions[i])directory.levels[i]=5;}
                     s.discovery.local(region,directory);
                 });});
@@ -359,9 +367,9 @@ public final class RemoteClient {
         if(!s.offer(()->{
             long timing=DebugLog.start();try {
                 var wants=new ArrayList<Protocol.Want>();var index=VoxyBridge.coverage(s.engine);
-                for(long p:positions){int cx=ChunkPos.getX(p),cz=ChunkPos.getZ(p);var stamp=index.directoryColumn(cx,cz);wants.add(new Protocol.Want(cx,cz,stamp.version(),stamp.level(),issued.get(p)));}
+                for(long p:positions){int cx=ChunkPos.getX(p),cz=ChunkPos.getZ(p);var stamp=index.directoryColumn(cx,cz);var pending=s.pending.get(p);if(pending!=null)wants.add(new Protocol.Want(cx,cz,stamp.version(),stamp.level(),issued.get(p),pending.desired()));}
                 long ready=DebugLog.start();Minecraft.getInstance().execute(()->{DebugLog.end(CLIENT_REQUEST_CONTROL,ready);if(session==s&&s.epoch==epoch){
-                    wants.removeIf(w->!currentRequest(s,ChunkPos.asLong(w.x(),w.z()),w.requestId()));
+                    wants.removeIf(w->!currentRequest(s,ChunkPos.asLong(w.x(),w.z()),w.requestId())||!inRange(s,w.x(),w.z()));
                     for(var w:wants){long p=ChunkPos.asLong(w.x(),w.z());var request=s.pending.get(p);request.before=new CoverageStore.Stamp(w.version(),w.level());request.dirtyBefore=s.versions.getOrDefault(p,0L);request.lastProgress=System.nanoTime();request.sent=true;if(w.level()<5&&w.version()>=request.dirtyBefore)s.checked.put(p,w.level());}
                     if(DebugLog.verbose())for(var w:wants)DebugLog.log("CLIENT want epoch={} generation={} x={} z={} request_id={} version={} level={} desired={}",s.epoch,s.generation,w.x(),w.z(),w.requestId(),w.version(),w.level(),desired(s,ChunkPos.asLong(w.x(),w.z())));
                     send(s,wants,cancels);refill(s);
@@ -393,13 +401,10 @@ public final class RemoteClient {
         retry(s,victim,"preempted");s.preempted++;
         return new Protocol.Cancel(ChunkPos.getX(victim),ChunkPos.getZ(victim),removed.id());
     }
-    private static boolean inRange(Session s,int x,int z){long dx=(long)x-s.x,dz=(long)z-s.z;return dx*dx+dz*dz<=(long)s.radius*s.radius;}
-    private static int desired(Session s,long p){return s.bands.select(ChunkPos.getX(p),ChunkPos.getZ(p),s.x,s.z);}
+    private static boolean inRange(Session s,int x,int z){return s.shape!=null&&s.shape.contains(x,z);}
+    private static int desired(Session s,long p){return s.shape==null?s.bands.select(ChunkPos.getX(p),ChunkPos.getZ(p),s.x,s.z):s.shape.desired(s.bands,ChunkPos.getX(p),ChunkPos.getZ(p));}
     private static boolean urgent(Session s,long p){
-        int target=desired(s,p),known=s.checked.getOrDefault(p,5),x=ChunkPos.getX(p),z=ChunkPos.getZ(p),size=1<<(s.bands.levels()[0]+2);
-        int bx=Math.floorDiv(x,size)*size,bz=Math.floorDiv(z,size)*size;
-        long dx=Math.max(Math.max(bx-s.x,s.x-(bx+size-1)),0),dz=Math.max(Math.max(bz-s.z,s.z-(bz+size-1)),0);
-        return dx*dx+dz*dz<=(long)s.bands.radii()[0]*s.bands.radii()[0]||known<5&&known>target;
+        int target=desired(s,p),known=s.checked.getOrDefault(p,5);return target==s.bands.levels()[0]||known<5&&known>target;
     }
     private static void retry(Session s,long p,String reason){
         if(!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p))){s.retries.remove(p);return;}
@@ -413,7 +418,7 @@ public final class RemoteClient {
             if(session!=s||s.epoch!=epoch||!currentRequest(s,p,requestId))return;
             var requested=s.pending.remove(p);
             var player=Minecraft.getInstance().player.chunkPosition();
-            int target=s.bands.select(ChunkPos.getX(p),ChunkPos.getZ(p),player.x,player.z);
+            int target=desired(s,p);
             long dirtyVersion=s.versions.getOrDefault(p,0L),latest=Math.max(responseVersion,dirtyVersion);
             boolean current=stamp.version()>=latest;
             s.discovery.updated(p,current?stamp:new CoverageStore.Stamp(0,5));
@@ -456,7 +461,9 @@ public final class RemoteClient {
     private static void send(Session s,List<Protocol.Want> wants){send(s,wants,List.of());}
     private static void send(Session s,List<Protocol.Want> wants,List<Protocol.Cancel> cancels){if(session==s&&!s.closed&&!maintenancePaused){
         if(DebugLog.verbose())DebugLog.log("CLIENT request world={} dimension={} epoch={} wants={} pending={} credit={} bandwidth_kib={}",s.hello.world(),s.hello.dimension(),s.epoch,wants.size(),s.pending.size(),s.networkCapacity,DistantConfig.DOWNLOAD_KBPS.get());
-        Protocol.CHANNEL.sendToServer(new Protocol.Requests(s.epoch,s.radius,s.view,DistantConfig.DOWNLOAD_KBPS.get(),s.networkCapacity,wants,cancels));
+        int envelope=s.shape==null?s.radius:Math.min(s.hello.radius(),(int)Math.ceil(Math.hypot(s.shape.centerX()-s.x,s.shape.centerZ()-s.z)+s.radius*(1+.5*s.shape.amount())));
+        for(var entry:s.pending.entrySet())if(entry.getValue().receiving){long p=entry.getKey();envelope=Math.min(s.hello.radius(),Math.max(envelope,(int)Math.ceil(Math.sqrt((double)(ChunkPos.getX(p)-s.x)*(ChunkPos.getX(p)-s.x)+(double)(ChunkPos.getZ(p)-s.z)*(ChunkPos.getZ(p)-s.z)))));}
+        Protocol.CHANNEL.sendToServer(new Protocol.Requests(s.epoch,envelope,s.view,DistantConfig.DOWNLOAD_KBPS.get(),s.networkCapacity,wants,cancels,s.shape));
     }}
     private static long reserve(Session s,Protocol.Fragment f){return Protocol.reservation(f.totalLength(),f.rawLength(),f.level(),s.hello.maxY()-s.hello.minY());}
     public static void fragment(Protocol.Fragment f) {
