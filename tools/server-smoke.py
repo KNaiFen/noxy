@@ -86,7 +86,9 @@ if options.diagnostics:
         raise AssertionError('Config upgrade integration checks did not finish')
     config = (run / 'config/voxy_distant.toml').read_text(encoding='utf-8')
     values = tomllib.loads(config)
-    assert values['configVersion'] == 5 and values['configLanguage'] == options.config_language
+    assert values['configVersion'] == 6 and values['configLanguage'] == options.config_language
+    assert values['client']['regionQueryWindow'] == 4
+    assert ('同时等待服务端缓存核验' if options.config_language == 'zh_cn' else 'Outstanding region cache checks') in config
     assert values['server']['generation']['columnTimeoutSeconds'] == 60
     assert 'DISTANT_CACHE_ISOLATION_PASS' in content
     assert values['server']['generation']['pauseTriggerTicks'] == 20

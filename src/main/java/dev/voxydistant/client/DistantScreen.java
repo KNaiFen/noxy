@@ -39,6 +39,7 @@ public final class DistantScreen extends Screen {
             new Setting("索引缓存 MiB", "客户端覆盖索引内存预算（最高 10240 MiB）；超出时自动缩短实际远景范围。", DistantConfig.INDEX_MIB),
             new Setting("处理占空比", "远景接收应用线程的工作占比。", DistantConfig.RECEIVE_DUTY),
             new Setting("请求窗口（列）", "最多允许多少列处于未完成请求状态。", DistantConfig.REQUEST_WINDOW),
+            new Setting("区域查询窗口", "同时等待服务端核验的区域数，范围 1～32，默认 4。调高可增加核验并发，仍受服务端处理、内存和带宽额度限制。", DistantConfig.REGION_QUERY_WINDOW),
             new Setting("请求提交（列/tick）", "每游戏 tick 最多提交多少列请求；调高会增加客户端索引查询、网络请求和服务端负载，仍受请求窗口及服务端上限约束。", DistantConfig.REQUEST_COLUMNS_PER_TICK));
     private static final List<Setting> DEBUG = List.of(
             new Setting("诊断日志", "本机日志写入 logs/latest.log；服务器日志在“服务端设置”中单独开启。", DistantConfig.DEBUG),

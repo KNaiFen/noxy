@@ -16,6 +16,7 @@ import java.util.function.Supplier;
 
 public final class Protocol {
     public static final int FRAGMENT_BYTES = 32768;
+    public static final int MAX_REGION_QUERIES = 32;
     public static long reservation(int total,int raw,int level,int sections){return total+raw*3L+(long)sections*(37448>>(level*3))+(2L<<20);}
     public static long batchReservation(int total,int raw,List<Member> members,int sections){
         // The receive worker expands and applies one member at a time.

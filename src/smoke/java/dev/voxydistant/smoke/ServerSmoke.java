@@ -163,11 +163,19 @@ public final class ServerSmoke {
             if(stage==9){if(!batchCheck(service))return;stage=12;}
             if(stage==12){if(!cacheIsolationCheck(service))return;
                 var peer=peers.getFirst();
-                if(!regionTestStarted){RemoteServer.regionQuery(peer.player,new Protocol.RegionQuery(1,70001,1,1));regionTestStarted=true;return;}
-                if(peer.summaries.isEmpty())return;
-                var summary=peer.summaries.getFirst();check(summary.epoch()==1&&summary.id()==70001&&summary.x()==1&&summary.z()==1,"region query lifecycle");
+                if(!regionTestStarted){
+                    var config=dev.voxydistant.config.DistantConfig.SPEC.getSpec().<net.minecraftforge.common.ForgeConfigSpec.ValueSpec>get(dev.voxydistant.config.DistantConfig.REGION_QUERY_WINDOW.getPath());
+                    check(config.test(1)&&config.test(32)&&!config.test(0)&&!config.test(33),"region query config range");
+                    var sessions=(Map<UUID,Object>)field(service,"players");var session=sessions.get(peer.player.getUUID());
+                    for(int i=0;i<=Protocol.MAX_REGION_QUERIES;i++)RemoteServer.regionQuery(peer.player,new Protocol.RegionQuery(1,70001+i,1,1));
+                    check(((Map<?,?>)field(session,"directories")).size()+((Deque<?>)field(session,"directoryReplies")).size()==32,"server accepts 32 region queries and bounds overflow");
+                    regionTestStarted=true;return;
+                }
+                if(peer.summaries.size()<Protocol.MAX_REGION_QUERIES)return;
+                check(peer.summaries.size()==32&&peer.summaries.stream().noneMatch(summary->summary.id()==70033),"region query window completes without overflow reply");
+                var summary=peer.summaries.stream().filter(reply->reply.id()==70001).findFirst().orElseThrow();check(summary.epoch()==1&&summary.x()==1&&summary.z()==1,"region query lifecycle");
                 int slot=(40&31)|((40&31)<<5);check(summary.versions()[slot]>=oldVersion,"region metadata includes cached revision");
-                System.out.println("DISTANT_REGION_DIRECTORY_PASS: bounded migration, summary round trip, region revision and transport budget");
+                System.out.println("DISTANT_REGION_DIRECTORY_PASS: config range 1-32, 32 queries complete, overflow bounded, migration, summary round trip, revision and transport budget");
                 benchmark(service);
                 for(var p:peers){var remove=RemoteServer.class.getDeclaredMethod("removePlayer",UUID.class);remove.setAccessible(true);remove.invoke(service,p.player.getUUID());}
                 check(((Map<?,?>)field(service,"players")).isEmpty(),"logout cleanup");

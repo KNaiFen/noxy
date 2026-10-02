@@ -289,7 +289,7 @@ public final class RemoteClient {
     private static void discoverRegions(Session s){
         long now=System.nanoTime();
         for(var it=s.regionQueries.entrySet().iterator();it.hasNext();){var q=it.next();if(now-q.getValue().sent()>TimeUnit.SECONDS.toNanos(30)){var region=q.getValue().region();region.queried=false;region.query=true;it.remove();}}
-        while(s.regionQueries.size()<4){var region=s.discovery.nextQuery();if(region==null)break;long id=++s.regionSequence;s.regionQueries.put(id,new RegionRequest(region,now));Protocol.CHANNEL.sendToServer(new Protocol.RegionQuery(s.epoch,id,region.x,region.z));}
+        while(s.regionQueries.size()<DistantConfig.REGION_QUERY_WINDOW.get()){var region=s.discovery.nextQuery();if(region==null)break;long id=++s.regionSequence;s.regionQueries.put(id,new RegionRequest(region,now));Protocol.CHANNEL.sendToServer(new Protocol.RegionQuery(s.epoch,id,region.x,region.z));}
         if(s.preparingDirectory||s.directoryTick==s.ticks||s.worker.getQueue().size()>=256)return;
         var tasks=new ArrayList<RegionDiscovery.Region>();
         for(var r:s.discovery.regions.values())if(r.prepare&&!r.migrate)tasks.add(r);

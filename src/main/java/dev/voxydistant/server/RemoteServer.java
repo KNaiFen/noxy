@@ -670,7 +670,7 @@ public final class RemoteServer {
     }
     public static void regionQuery(ServerPlayer player,Protocol.RegionQuery query){
         var self=instance;if(self==null||self.stopping)return;var s=self.players.get(player.getUUID());
-        if(s==null||query.epoch()!=s.epoch||s.directories.size()+s.directoryReplies.size()>=4)return;
+        if(s==null||query.epoch()!=s.epoch||s.directories.size()+s.directoryReplies.size()>=Protocol.MAX_REGION_QUERIES)return;
         long dx=Math.max(Math.max((long)query.x()*32-player.chunkPosition().x,(long)player.chunkPosition().x-((long)query.x()*32+31)),0),
                 dz=Math.max(Math.max((long)query.z()*32-player.chunkPosition().z,(long)player.chunkPosition().z-((long)query.z()*32+31)),0);
         if(dx*dx+dz*dz>(long)s.radius*s.radius)return;
