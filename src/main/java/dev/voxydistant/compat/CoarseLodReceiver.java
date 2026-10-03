@@ -20,11 +20,8 @@ public final class CoarseLodReceiver {
         private final WorldEngine world;
         private final CoverageStore coverage;
         private final java.util.Map<Long,Node> pending=new java.util.HashMap<>();
-        private int columns;
         public Batch(WorldEngine world){this.world=world;coverage=VoxyBridge.coverage(world);}
         private void add(java.util.Map<Long,Integer> touched,int min){
-            if(touched.isEmpty())return;
-            if(columns++==0){publish(world,coverage,touched,min);return;}
             for(var entry:touched.entrySet()){
                 long key=entry.getKey();coverage.awaitingSave(key);
                 var node=pending.get(key);
@@ -33,7 +30,7 @@ public final class CoarseLodReceiver {
                 node.children|=entry.getValue()>>>8;
                 node.fullOccupancy|=min==0;
             }
-            if(columns==8||pending.size()>=MAX_PENDING)flush();
+            if(pending.size()>=MAX_PENDING)flush();
         }
         private void flush(){
             try{for(var node:pending.values()){
@@ -41,7 +38,7 @@ public final class CoarseLodReceiver {
                 if(section.lvl>0){if(node.fullOccupancy)VoxyBridge.occupancy(section);else VoxyBridge.occupancy(section,node.children);}
                 world.markDirty(section,WorldEngine.DEFAULT_UPDATE_FLAGS,node.neighbors);
                 world.saveSection(section,true,false);
-            }}finally{for(var node:pending.values())node.section.release();pending.clear();columns=0;}
+            }}finally{for(var node:pending.values())node.section.release();pending.clear();}
         }
         public void finish(){synchronized(coverage){flush();}}
         private static final class Node {

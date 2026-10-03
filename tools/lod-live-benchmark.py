@@ -31,6 +31,8 @@ parser.add_argument('--radius', type=int, default=72)
 parser.add_argument('--server-radius', type=int, help='Server permission radius; defaults to --radius')
 parser.add_argument('--hold', action='store_true', help='Leave the final measured scene open until hold.txt is changed to stop')
 parser.add_argument('--tag', default='', help='Suffix for a fresh run directory')
+parser.add_argument('--cold-client', action='store_true', help='Exclude any source Voxy cache and verify a fresh client cache before launch')
+parser.add_argument('--profile-pipeline', action='store_true', help='Record both JVMs with JFR only during reception; report profiling separately')
 parser.add_argument('--acceptance', action='store_true', help='Functional diagnosis only; never writes benchmark complete.json')
 parser.add_argument('--debug', action='store_true', help='Enable mod diagnostics on both sides')
 parser.add_argument('--debug-overlay', action='store_true', help='Show the F3 overlay in acceptance screenshots')
@@ -42,6 +44,8 @@ parser.add_argument('--client-directory', type=Path, help='Isolated client sourc
 parser.add_argument('--retain-run-games', action='store_true', help='Keep this run\'s client and server game directories to prepare a cache-reopen input')
 parser.add_argument('--receive-memory', type=int, default=128, choices=[32, 64, 128, 256], help='Client receive budget in MiB')
 parser.add_argument('--player-send-memory', type=int, default=32, help='Server per-player send queue in MiB; also caps advertised credit at four times this value')
+parser.add_argument('--player-concurrency', type=int, help='Override server per-player cache/generation concurrency, 1..64')
+parser.add_argument('--server-requests-per-tick', type=int, default=256, help='Server per-player request admission limit, 1..4096')
 parser.add_argument('--request-window', type=int, default=256, help='Client outstanding column window, 1..1024')
 parser.add_argument('--max-batch-columns',type=int,default=16,help='Server maximum columns per compressed batch, 1..128')
 parser.add_argument('--diagnostic-columns', type=int, help='Stop after this many naturally ordered columns; incomplete diagnosis, never an acceptance pass')
@@ -81,12 +85,16 @@ if not 0.01 <= options.bandwidth_mbps <= 1000:
     parser.error('--bandwidth-mbps must be from 0.01 to 1000')
 if not 1 <= options.request_window <= 1024:
     parser.error('--request-window must be from 1 to 1024')
+if options.player_concurrency is not None and not 1 <= options.player_concurrency <= 64:
+    parser.error('--player-concurrency must be from 1 to 64')
+if not 1 <= options.server_requests_per_tick <= 4096:
+    parser.error('--server-requests-per-tick must be from 1 to 4096')
 if options.submissions_per_second is not None and (options.rate == 'default' or not 1 <= options.submissions_per_second <= 10000):
     parser.error('--submissions-per-second requires --rate custom/full and a value from 1 to 10000')
 submission_rate = 2048 if options.rate == 'default' else (options.submissions_per_second or (8192 if options.rate == 'custom' else 1000))
 if options.verbose and not options.debug:
     parser.error('--verbose requires --debug')
-if (options.debug or options.debug_overlay or options.capture_check or options.reconnect_check or options.diagnostic_columns or options.visibility_diagnostic or options.turn_check or options.record_process or options.settings_check or options.import_first or options.voxy_import or options.exclusive_import_check or options.cached_import_check) and not options.acceptance:
+if (options.debug or options.profile_pipeline or options.debug_overlay or options.capture_check or options.reconnect_check or options.diagnostic_columns or options.visibility_diagnostic or options.turn_check or options.record_process or options.settings_check or options.import_first or options.voxy_import or options.exclusive_import_check or options.cached_import_check) and not options.acceptance:
     parser.error('--debug and --capture-check require --acceptance; diagnostic runs are excluded from benchmarks')
 if options.acceptance and (options.rounds != 1 or ',' in options.profiles):
     parser.error('Acceptance requires one explicit --profiles value and --rounds 1')
@@ -102,6 +110,8 @@ if not 1 <= options.cruise_bounds <= 96:
     parser.error('--cruise-bounds must be from 1 to 96')
 if options.client_cache and (not options.acceptance or not options.client_cache.is_dir()):
     parser.error('--client-cache requires --acceptance and an existing .voxy directory')
+if options.cold_client and options.client_cache:
+    parser.error('--cold-client cannot use --client-cache')
 if not server_source.is_dir() or not client_source.is_dir():
     parser.error('Server and client source directories must exist')
 if options.voxy_import and (options.import_first or not 1 <= options.voxy_threads <= 256):
@@ -300,7 +310,8 @@ cacheMemoryMiB = 128
 totalBandwidthMbps = {options.bandwidth_mbps}
 [server.generation]
 preset = "{preset}"
-playerConcurrency = {32 if options.rate == 'full' else 8}
+playerConcurrency = {options.player_concurrency or (32 if options.rate == 'full' else 8)}
+playerRequestsPerTick = {options.server_requests_per_tick}
 playerRequestQueueColumns = 256
 queueColumns = 2048
 snapshotMemoryMiB = 128
@@ -539,7 +550,9 @@ for round_index in range(options.rounds):
         server_home = run / 'server-game'
         shutil.copytree(server_source, server_home, ignore=shutil.ignore_patterns('session.lock', 'logs', 'crash-reports'))
         client_dir = run / 'game'
-        shutil.copytree(client_source, client_dir, ignore=shutil.ignore_patterns('logs', 'crash-reports', *(['.voxy'] if options.client_cache else [])))
+        shutil.copytree(client_source, client_dir, ignore=shutil.ignore_patterns('logs', 'crash-reports', *(['.voxy'] if options.client_cache or options.cold_client else [])))
+        if options.cold_client and (client_dir / '.voxy').exists():
+            raise AssertionError('Cold client must have no source Voxy cache')
         if options.client_cache:
             shutil.copytree(options.client_cache, client_dir / '.voxy')
         (client_dir / 'config/voxy_distant.toml').write_text(f'''[client]
@@ -573,7 +586,10 @@ meshDetails = {str(options.verbose).lower()}
             'profile': profile, 'bands': bands[profile], 'radius': options.radius, 'debug': options.debug,
             'receive_memory_mib': options.receive_memory, 'player_send_memory_mib': options.player_send_memory,
             'request_window_columns': options.request_window,
+            'player_concurrency': options.player_concurrency or (32 if options.rate == 'full' else 8),
+            'server_requests_per_tick': options.server_requests_per_tick,
             'max_batch_columns': options.max_batch_columns,
+            'cold_client': options.cold_client, 'profile_pipeline': options.profile_pipeline,
             'submissions_per_second': submission_rate,
             'bandwidth_mbps': options.bandwidth_mbps,
             'visibility_diagnostic': options.visibility_diagnostic, 'capture_interval_seconds': options.capture_interval,
@@ -581,7 +597,7 @@ meshDetails = {str(options.verbose).lower()}
             'record_process': options.record_process,
             'import_first': options.import_first,
             'client_source': str(client_source),
-            'client_cache_source': str(options.client_cache.resolve()) if options.client_cache else str(client_source / '.voxy') if (client_source / '.voxy').is_dir() else None,
+            'client_cache_source': None if options.cold_client else str(options.client_cache.resolve()) if options.client_cache else str(client_source / '.voxy') if (client_source / '.voxy').is_dir() else None,
             'server_source': str(server_source),
             'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
             'working_tree': subprocess.check_output(['git', 'status', '--short'], cwd=root, text=True)}), encoding='utf-8')
@@ -639,8 +655,14 @@ meshDetails = {str(options.verbose).lower()}
                 import runpy
                 settings_check = runpy.run_path(str(root / 'tools/lod-settings-check.py'))['check_settings']
                 settings_check(client, server, run / 'client', server_home / 'config/voxy_distant.toml', client_command, command)
+            if options.profile_pipeline:
+                for kind, process in [('server', server), ('client', client)]:
+                    spec = json.loads((base / f'{kind}-launch.json').read_text())
+                    jcmd = Path(spec['args'][0]).with_name('jcmd.exe' if os.name == 'nt' else 'jcmd')
+                    subprocess.run([str(jcmd), str(process.pid), 'JFR.start', 'name=pipeline', 'settings=profile', 'maxsize=512m'], check=True, capture_output=True, timeout=30)
             start = time.time()
             receive_ack = client_command(client, run / 'client', 'receive')
+            (run / 'receive-start.json').write_text(json.dumps(receive_ack), encoding='utf-8')
             if options.prediction_check:
                 spec=json.loads((base/'client-launch.json').read_text());jcmd=str(Path(spec['args'][0]).with_name('jcmd.exe' if os.name=='nt' else 'jcmd'))
                 subprocess.run([jcmd,str(client.pid),'JFR.start','name=prediction','settings=profile'],check=True,capture_output=True,timeout=20)
@@ -784,6 +806,11 @@ meshDetails = {str(options.verbose).lower()}
             else:
                 raise TimeoutError(f'{name}: incomplete reception')
             elapsed = time.time() - start
+            if options.profile_pipeline:
+                for kind, process in [('server', server), ('client', client)]:
+                    spec = json.loads((base / f'{kind}-launch.json').read_text())
+                    jcmd = Path(spec['args'][0]).with_name('jcmd.exe' if os.name == 'nt' else 'jcmd')
+                    subprocess.run([str(jcmd), str(process.pid), 'JFR.stop', 'name=pipeline', 'filename=' + str(run / kind / 'pipeline.jfr')], check=True, capture_output=True, timeout=30)
             memory_samples.close()
             expected_receive = options.receive_memory * 1048576
             expected_snapshot = min(32 * 1048576, expected_receive // 4)

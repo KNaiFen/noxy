@@ -55,6 +55,12 @@ public final class ClientSmoke {
         CoarseLodReceiver.receive(engine,column(11,2,0),registries);check(index.column(-1,-1,0,1).equals(new CoverageStore.Stamp(11,2)),"new coarse replaces stale fine");
         var coarse=engine.acquire(2,-1,0,-1);try{for(long value:coarse._unsafeGetRawDataArray())check(Mapper.isAir(value),"explicit new air clears parent");}finally{coarse.release();}
         var fine=engine.acquire(0,-1,0,-1);try{check(Arrays.stream(fine._unsafeGetRawDataArray()).anyMatch(v->!Mapper.isAir(v)),"stale L0 remains stored");}finally{fine.release();}
+        published.clear();var batch=new CoarseLodReceiver.Batch(engine);
+        for(int x=0;x<16;x++){var c=column(20,2,1);CoarseLodReceiver.receive(engine,new LodColumn(x,0,0,20,c.states(),c.biomes(),c.sections()),registries,true,batch);}
+        check(published.isEmpty(),"coarse batch defers shared parent publication");batch.finish();
+        check(published.size()==new HashSet<>(published).size(),"shared coarse nodes publish once within the bounded batch");
+        for(int x=0;x<16;x++)check(index.column(x,0,0,1).equals(new CoverageStore.Stamp(20,2)),"batched coverage retained");
+        index.checkpoint(storage::flush);
         compareMipper(engine.getMapper());checkNodeSwitch();checkCachedMesh(engine);checkIndexRebuild();index.closeUnconfirmed();
         System.out.println("DISTANT_CLIENT_INGEST_PASS: actual Voxy sparse L4/L3/L2/L1/L0, stale rejection, coarse replacement, retained L0, 10000 mipper comparisons");
     }

@@ -597,22 +597,24 @@ public final class RemoteClient {
                     if(buffer.hasRemaining())throw new IllegalArgumentException("Trailing batch bytes");
                     buffer.position(4);complete.trace.decode+=DebugLog.end(CLIENT_DECODE,decode);
                     var batch=new CoarseLodReceiver.Batch(s.engine);
-                    try{for(var m:members){
-                        if(s.closed||s.epoch!=f.epoch())return;
-                        int length=buffer.getInt();byte[] bytes=new byte[length];buffer.get(bytes);
-                        decode=DebugLog.start();var column=ColumnCodec.decodeRaw(bytes,31);complete.trace.decode+=DebugLog.end(CLIENT_DECODE,decode);
-                        if(column.x()!=m.x()||column.z()!=m.z()||column.version()!=m.version()||column.minimumLevel()!=m.level()||column.minY()!=s.hello.minY()||column.sections().length!=s.hello.maxY()-s.hello.minY())throw new IllegalArgumentException("Batch column metadata mismatch");
-                        long p=ChunkPos.asLong(m.x(),m.z());
-                        long latest=s.versions.getOrDefault(p,0L);
-                        var coverage=VoxyBridge.coverage(s.engine);
-                        long lock=DebugLog.start();
-                        synchronized(coverage){
-                            DebugLog.end(CLIENT_COVERAGE_LOCK,lock);
+                    var coverage=VoxyBridge.coverage(s.engine);
+                    long lock=DebugLog.start();
+                    // Save workers snapshot the completed batch, so shared parent
+                    // nodes are not serialized again after each member changes them.
+                    synchronized(coverage){
+                        DebugLog.end(CLIENT_COVERAGE_LOCK,lock);
+                        try{for(var m:members){
+                            if(s.closed||s.epoch!=f.epoch())return;
+                            int length=buffer.getInt();byte[] bytes=new byte[length];buffer.get(bytes);
+                            decode=DebugLog.start();var column=ColumnCodec.decodeRaw(bytes,31);complete.trace.decode+=DebugLog.end(CLIENT_DECODE,decode);
+                            if(column.x()!=m.x()||column.z()!=m.z()||column.version()!=m.version()||column.minimumLevel()!=m.level()||column.minY()!=s.hello.minY()||column.sections().length!=s.hello.maxY()-s.hello.minY())throw new IllegalArgumentException("Batch column metadata mismatch");
+                            long p=ChunkPos.asLong(m.x(),m.z());
+                            long latest=s.versions.getOrDefault(p,0L);
                             if(session==s&&s.epoch==f.epoch()&&currentRequest(s,p,m.requestId())&&!s.loadedFull.contains(p)&&column.version()>=latest){long apply=DebugLog.start();int conflicts=coverage.conflicts(column.x(),column.z(),s.hello.minY(),s.hello.maxY(),column.version());if(conflicts>0){DebugLog.count(CLIENT_OLD_VERSION_REPLACED);if(DebugLog.verbose())DebugLog.log("CLIENT authoritative_replace x={} z={} reply_version={} newer_sections={}",column.x(),column.z(),column.version(),conflicts);}CoarseLodReceiver.receive(s.engine,column,s.registries,true,batch);complete.trace.apply+=DebugLog.end(CLIENT_APPLY,apply);s.applied++;complete.trace.applied++;}
-                        }
-                        if(DebugLog.verbose())DebugLog.log("CLIENT column epoch={} transfer={} x={} z={} request_id={} level={} version={} latest={} raw_bytes={} applied={}",f.epoch(),f.transfer(),m.x(),m.z(),m.requestId(),m.level(),m.version(),latest,m.rawLength(),currentRequest(s,p,m.requestId())&&column.version()>=latest);
-                        completed(s,f.epoch(),p,m.requestId(),m.version(),"batch");
-                    }}finally{batch.finish();}
+                            if(DebugLog.verbose())DebugLog.log("CLIENT column epoch={} transfer={} x={} z={} request_id={} level={} version={} latest={} raw_bytes={} applied={}",f.epoch(),f.transfer(),m.x(),m.z(),m.requestId(),m.level(),m.version(),latest,m.rawLength(),currentRequest(s,p,m.requestId())&&column.version()>=latest);
+                            completed(s,f.epoch(),p,m.requestId(),m.version(),"batch");
+                        }}finally{batch.finish();}
+                    }
                     result="ok";
                 }catch(RuntimeException e){result="failed";if(DebugLog.enabled())DebugLog.log("CLIENT failed epoch={} transfer={} error={}",f.epoch(),f.transfer(),e.toString());failed(s,e);}
                 finally{long paced=System.nanoTime();pace(started);complete.trace.applied(started,paced,result);s.memory.addAndGet(-complete.reservation);if(session==s&&s.epoch==f.epoch()){complete.trace.receipt();Protocol.CHANNEL.sendToServer(new Protocol.Receipt(f.epoch(),f.transfer()));}}

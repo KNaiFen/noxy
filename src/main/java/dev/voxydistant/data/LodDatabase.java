@@ -149,7 +149,7 @@ public final class LodDatabase implements AutoCloseable {
         if(stored==null)return new Metadata(0,revision,0);
         try{
             byte[] header;
-            if(stored[0]!=0)try(var stream=new ZstdInputStreamNoFinalizer(new ByteArrayInputStream(stored,5,stored.length-5))){header=stream.readNBytes(25);}
+            if(stored[0]!=0)try(var stream=new ZstdInputStreamNoFinalizer(new ByteArrayInputStream(stored,5,stored.length-5),com.github.luben.zstd.RecyclingBufferPool.INSTANCE)){header=stream.readNBytes(25);}
             else header=Arrays.copyOfRange(stored,5,30);
             if(header.length!=25)throw new IllegalArgumentException("Truncated LOD header");
             var b=ByteBuffer.wrap(header);if(b.getInt()!=1)throw new IllegalArgumentException("Unknown LOD schema");

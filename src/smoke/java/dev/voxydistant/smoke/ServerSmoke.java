@@ -103,7 +103,7 @@ public final class ServerSmoke {
                 var missing=(Set<?>)field(service,"missingChecks");missing.clear();
                 var dirty=(Map<?,?>)field(service,"dirty");dirty.clear();
                 if(Boolean.getBoolean("voxyDistant.serverHotspotCheck")){ServerHotspotCheck.run(server,service);stage=3;server.halt(false);return;}
-                priorityCheck();pumpCheck(service);fragmentSliceCheck();
+                priorityCheck();pumpCheck(service);fragmentSliceCheck();codecSkipCheck();
                 var sessions=(Map<UUID,Object>)field(service,"players");var type=Class.forName("dev.voxydistant.server.RemoteServer$Session");var ctor=type.getDeclaredConstructor(ServerPlayer.class);ctor.setAccessible(true);
                 for(int i=0;i<2;i++){Peer p=new Peer(i);peers.add(p);sessions.put(p.player.getUUID(),ctor.newInstance(p.player));RemoteServer.requests(p.player,new Protocol.Requests(1,96,2,0,32<<20,List.of(new Protocol.Want(40,40,0,5))));}
                 start=System.nanoTime();stage=1;
@@ -196,6 +196,32 @@ public final class ServerSmoke {
         }catch(Exception|AssertionError e){e.printStackTrace();System.out.println("DISTANT_SMOKE_FAIL");stage=3;server.halt(false);server=null;}
     }
     private boolean regionTestStarted;
+    private void codecSkipCheck(){
+        var buf=new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());byte[] raw;int firstIndex;
+        try{
+            buf.writeInt(1);buf.writeInt(-17);buf.writeInt(31);buf.writeInt(-4);buf.writeLong(91);buf.writeByte(3);
+            buf.writeVarInt(1);buf.writeNbt(net.minecraft.nbt.NbtUtils.writeBlockState(net.minecraft.world.level.block.Blocks.AIR.defaultBlockState()));
+            buf.writeVarInt(1);buf.writeUtf("minecraft:plains");buf.writeVarInt(1);buf.writeVarInt(256);
+            for(int i=0;i<256;i++){buf.writeVarInt(0);buf.writeVarInt(0);buf.writeByte(i);buf.writeByte(0);}
+            firstIndex=buf.writerIndex();
+            buf.writeByte(128);buf.writeByte(128);buf.writeByte(0); // Legal three-byte zero.
+            buf.writeByte(255);buf.writeByte(129);buf.writeByte(0); // Legal three-byte 255.
+            for(int i=0;i<4;i++)buf.writeByte(128);buf.writeByte(0); // Legal five-byte zero.
+            for(int i=3;i<4096;i++)buf.writeVarInt(i&255);
+            buf.writeVarInt(1);buf.writeVarInt(0);buf.writeVarInt(0);buf.writeByte(15);buf.writeByte(0);
+            raw=new byte[buf.readableBytes()];buf.readBytes(raw);
+        }finally{buf.release();}
+        var full=ColumnCodec.decodeRaw(raw,31);
+        for(int mask=0;mask<32;mask++){
+            var sparse=ColumnCodec.decodeRaw(raw,mask);
+            check(sparse.x()==full.x()&&sparse.z()==full.z()&&sparse.minY()==full.minY()&&sparse.version()==full.version()&&sparse.states().equals(full.states())&&sparse.biomes().equals(full.biomes()),"sparse codec header/palettes");
+            for(int level=0;level<5;level++)check(Arrays.equals(sparse.sections()[0][level],(mask&(1<<level))!=0?full.sections()[0][level]:null),"sparse codec levels");
+        }
+        byte[] invalid=raw.clone();invalid[firstIndex+2]=2;boolean rejected=false;
+        try{ColumnCodec.decodeRaw(invalid,2);}catch(IllegalArgumentException expected){rejected=true;}
+        check(rejected,"excluded level still validates invalid palette index");
+        System.out.println("DISTANT_CODEC_SKIP_PASS: 32 masks, one/two/three/five-byte indexes and invalid excluded index");
+    }
     private void fragmentSliceCheck(){
         byte[] data=new byte[70000];new Random(483).nextBytes(data);
         for(int length:new int[]{1,127,128,32768}){

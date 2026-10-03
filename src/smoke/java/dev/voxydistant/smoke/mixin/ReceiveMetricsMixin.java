@@ -11,8 +11,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(value=CoarseLodReceiver.class,remap=false)
 public class ReceiveMetricsMixin {
-    @Inject(method="receive",at=@At("HEAD"))
-    private static void start(WorldEngine engine,LodColumn column,RegistryAccess registry,CallbackInfo ci){LodMetrics.begin(2);}
-    @Inject(method="receive",at=@At("RETURN"))
-    private static void end(WorldEngine engine,LodColumn column,RegistryAccess registry,CallbackInfo ci){LodMetrics.end(2,column.minimumLevel(),0,0);}
+    @Inject(method="receive(Lme/cortex/voxy/common/world/WorldEngine;Ldev/voxydistant/data/LodColumn;Lnet/minecraft/core/RegistryAccess;ZLdev/voxydistant/compat/CoarseLodReceiver$Batch;)V",at=@At("HEAD"))
+    private static void start(WorldEngine engine,LodColumn column,RegistryAccess registry,boolean authoritative,CoarseLodReceiver.Batch batch,CallbackInfo ci){LodMetrics.begin(2);}
+    @Inject(method="receive(Lme/cortex/voxy/common/world/WorldEngine;Ldev/voxydistant/data/LodColumn;Lnet/minecraft/core/RegistryAccess;ZLdev/voxydistant/compat/CoarseLodReceiver$Batch;)V",at=@At("RETURN"))
+    private static void end(WorldEngine engine,LodColumn column,RegistryAccess registry,boolean authoritative,CoarseLodReceiver.Batch batch,CallbackInfo ci){LodMetrics.end(2,column.minimumLevel(),0,0);}
 }

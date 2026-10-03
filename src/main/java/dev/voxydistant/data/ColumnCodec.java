@@ -97,16 +97,33 @@ public final class ColumnCodec {
             long[][][] sections = new long[count][5][];
             for (var section : sections) for (int l = 0; l < 5; l++) if ((mask & (1 << l)) != 0) {
                 int length = 4096 >> (l * 3);
-                long[] palette = new long[bounded(buf.readVarInt(), 1, length)];
-                for (int i = 0; i < palette.length; i++) {
+                int paletteSize = bounded(buf.readVarInt(), 1, length);
+                boolean wanted = (wantedMask & (1 << l)) != 0;
+                long[] palette = wanted ? new long[paletteSize] : null;
+                for (int i = 0; i < paletteSize; i++) {
                     int state = bounded(buf.readVarInt(), 0, states.size() - 1), biome = bounded(buf.readVarInt(), 0, biomes.size() - 1);
-                    palette[i] = LodColumn.voxel(state, biome, buf.readUnsignedByte(), bounded(buf.readUnsignedByte(), 0, 15));
+                    int light = buf.readUnsignedByte(), occupancy = bounded(buf.readUnsignedByte(), 0, 15);
+                    if (wanted) palette[i] = LodColumn.voxel(state, biome, light, occupancy);
                 }
-                if((wantedMask&(1<<l))!=0){
+                if(wanted){
                     long[] values = section[l] = new long[length];
-                    if (palette.length == 1) Arrays.fill(values, palette[0]);
-                    else for (int i = 0; i < length; i++) values[i] = palette[bounded(buf.readVarInt(), 0, palette.length - 1)];
-                }else if(palette.length>1)for(int i=0;i<length;i++)bounded(buf.readVarInt(),0,palette.length-1);
+                    if (paletteSize == 1) Arrays.fill(values, palette[0]);
+                    else for (int i = 0; i < length; i++) values[i] = palette[bounded(buf.readVarInt(), 0, paletteSize - 1)];
+                }else if(paletteSize>1){
+                    // Stored palette indices normally take one or two bytes. Validate
+                    // them directly instead of dispatching through ByteBuf per byte.
+                    int cursor=buf.readerIndex();
+                    for(int i=0;i<length;i++){
+                        int value=raw[cursor++]&255;
+                        if(value>=128){
+                            int next=raw[cursor++]&255;
+                            if(next<128)value=(value&127)|(next<<7);
+                            else{buf.readerIndex(cursor-2);value=buf.readVarInt();cursor=buf.readerIndex();}
+                        }
+                        bounded(value,0,paletteSize-1);
+                    }
+                    buf.readerIndex(cursor);
+                }
             }
             if (buf.isReadable()) throw new IllegalArgumentException("Trailing LOD bytes");
             return new LodColumn(x, z, minY, revision, List.copyOf(states), List.copyOf(biomes), sections);

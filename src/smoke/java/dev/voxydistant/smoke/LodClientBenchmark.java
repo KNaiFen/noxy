@@ -190,7 +190,7 @@ public final class LodClientBenchmark {
                             var saving=me.cortex.voxy.commonImpl.VoxyInstance.class.getDeclaredField("savingService");saving.setAccessible(true);
                             voxySaving=(me.cortex.voxy.common.world.service.SectionSavingService)saving.get(instance);
                         }
-                        else if(command.equals("receive")){if(mc.level==null||RemoteClient.greeting()==null)throw new IllegalStateException("World or LOD handshake not ready");recording=Boolean.getBoolean("voxyDistant.recordProcess");DistantConfig.RECEIVE.set(true);}
+                        else if(command.equals("receive")){if(mc.level==null||RemoteClient.greeting()==null)throw new IllegalStateException("World or LOD handshake not ready");if(Boolean.getBoolean("voxyDistant.fixedCamera")){mc.options.pauseOnLostFocus=false;mc.setScreen(null);}recording=Boolean.getBoolean("voxyDistant.recordProcess");DistantConfig.RECEIVE.set(true);}
                         else if(command.equals("receive-disable")){DistantConfig.RECEIVE.set(false);}
                         else if(command.equals("prediction-toggle")){DistantConfig.MOVEMENT_PREDICTION.set(request.get("enabled").getAsBoolean());}
                         else if(command.equals("cpu-view")){mc.options.pauseOnLostFocus=false;mc.options.enableVsync().set(false);mc.getWindow().updateVsync(false);mc.options.framerateLimit().set(260);mc.setScreen(null);mc.player.setYRot(0);mc.player.setXRot(15);}
