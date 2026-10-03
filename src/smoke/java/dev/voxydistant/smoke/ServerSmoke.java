@@ -102,7 +102,7 @@ public final class ServerSmoke {
                 // Keep incidental spawn refresh work from changing the foreground conversion counter.
                 var missing=(Set<?>)field(service,"missingChecks");missing.clear();
                 var dirty=(Map<?,?>)field(service,"dirty");dirty.clear();
-                priorityCheck();
+                priorityCheck();pumpCheck(service);fragmentSliceCheck();
                 var sessions=(Map<UUID,Object>)field(service,"players");var type=Class.forName("dev.voxydistant.server.RemoteServer$Session");var ctor=type.getDeclaredConstructor(ServerPlayer.class);ctor.setAccessible(true);
                 for(int i=0;i<2;i++){Peer p=new Peer(i);peers.add(p);sessions.put(p.player.getUUID(),ctor.newInstance(p.player));RemoteServer.requests(p.player,new Protocol.Requests(1,96,2,0,32<<20,List.of(new Protocol.Want(40,40,0,5))));}
                 start=System.nanoTime();stage=1;
@@ -162,7 +162,7 @@ public final class ServerSmoke {
                 stage=9;batchCheck(service);return;
             }
             if(stage==9){if(!batchCheck(service))return;stage=12;}
-            if(stage==12){if(!cacheIsolationCheck(service))return;
+            if(stage==12){if(!regionTestStarted&&!cacheIsolationCheck(service))return;
                 var peer=peers.getFirst();
                 if(!regionTestStarted){
                     var config=dev.voxydistant.config.DistantConfig.SPEC.getSpec().<net.minecraftforge.common.ForgeConfigSpec.ValueSpec>get(dev.voxydistant.config.DistantConfig.REGION_QUERY_WINDOW.getPath());
@@ -195,6 +195,45 @@ public final class ServerSmoke {
         }catch(Exception|AssertionError e){e.printStackTrace();System.out.println("DISTANT_SMOKE_FAIL");stage=3;server.halt(false);server=null;}
     }
     private boolean regionTestStarted;
+    private void fragmentSliceCheck(){
+        byte[] data=new byte[70000];new Random(483).nextBytes(data);
+        for(int length:new int[]{1,127,128,32768}){
+            int offset=17003;byte[] slice=Arrays.copyOfRange(data,offset,offset+length);
+            var actual=new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());var expected=new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
+            try{
+                Protocol.CHANNEL.encodeMessage(new Protocol.Fragment(7,91,40,-8,19,2,93,false,70000,70000,offset,data,offset,length),actual);
+                Protocol.CHANNEL.encodeMessage(new Protocol.Fragment(7,91,40,-8,19,2,93,false,70000,70000,offset,slice),expected);
+                check(io.netty.buffer.ByteBufUtil.equals(actual,expected),"single fragment slice keeps exact wire bytes");
+                for(int transferOffset:new int[]{0,offset}){
+                    actual.clear();expected.clear();var members=transferOffset==0?List.of(new Protocol.Member(40,-8,19,2,93,70000)):List.<Protocol.Member>of();
+                    Protocol.writeBatch(new Protocol.BatchFragment(7,91,false,70000,70000,transferOffset,members,data,offset,length),actual);
+                    Protocol.writeBatch(new Protocol.BatchFragment(7,91,false,70000,70000,transferOffset,members,slice),expected);
+                    check(io.netty.buffer.ByteBufUtil.equals(actual,expected),"batch fragment slice keeps exact wire bytes");
+                    var decoded=Protocol.readBatch(actual);check(Arrays.equals(decoded.bytes(),slice)&&decoded.members().equals(members),"slice decodes as bounded fragment");
+                }
+            }finally{actual.release();expected.release();}
+        }
+        System.out.println("DISTANT_FRAGMENT_SLICE_PASS: exact single/batch wire bytes, headers, varint boundaries and decoding");
+    }
+    private void pumpCheck(Object service)throws Exception{
+        var complete=RemoteServer.class.getDeclaredMethod("complete",Runnable.class);complete.setAccessible(true);
+        var pump=RemoteServer.class.getDeclaredMethod("pump");pump.setAccessible(true);
+        var executed=new ArrayList<Integer>();int before=server.getPendingTasksCount();
+        var futures=new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+        for(int i=0;i<4;i++){int worker=i;futures.add(java.util.concurrent.CompletableFuture.runAsync(()->{
+            for(int n=0;n<32;n++){int id=worker*32+n;try{complete.invoke(service,(Runnable)()->{
+                check(server.isSameThread(),"completion commits on server thread");executed.add(id);
+            });}catch(ReflectiveOperationException e){throw new IllegalStateException(e);}}
+        }));}
+        java.util.concurrent.CompletableFuture.allOf(futures.toArray(java.util.concurrent.CompletableFuture[]::new)).join();
+        check(server.getPendingTasksCount()==before+1,"128 worker completions queue one server task");
+        pump.invoke(service);check(executed.size()==64,"completion pass commits at most 64 results");
+        pump.invoke(service);check(executed.size()==128&&new HashSet<>(executed).size()==128,"all concurrent completions commit exactly once");
+        for(int worker=0;worker<4;worker++){int previous=-1;for(int id:executed)if(id/32==worker){check(id>previous,"per-worker completion order");previous=id;}}
+        complete.invoke(service,(Runnable)()->executed.add(128));pump.invoke(service);
+        check(executed.size()==129,"completion after clearing scheduled flag still wakes server");
+        System.out.println("DISTANT_SERVER_PUMP_PASS: concurrent completions, one wakeup, bounded commit, exact release and server ownership");
+    }
     @SuppressWarnings("unchecked") private boolean cacheIsolationCheck(Object service)throws ReflectiveOperationException{
         var sessions=(Map<UUID,Object>)field(service,"players");
         var work=(Map<RemoteServer.Key,Object>)field(service,"work");
@@ -328,7 +367,7 @@ public final class ServerSmoke {
             if(batchCase==4)check(batchPeer.batches.equals(List.of(3)),"incomplete tail sent");
             sessions.remove(batchPeer.player.getUUID());batchPeer=null;
         }
-        if(batchCase==5){batchLifecycleCheck(service);dev.voxydistant.config.DistantConfig.PLAYER_SEND_MIB.set(32);dev.voxydistant.config.DistantConfig.TOTAL_MBPS.set(8.0);dev.voxydistant.config.DistantConfig.MAX_BATCH_COLUMNS.set(1);System.out.println("DISTANT_BATCH_PASS: 16/128, mixed levels, fragmentation, credit split, tail, repeated requests, stale/abort/epoch and exact budget release");return true;}
+        if(batchCase==5){batchLifecycleCheck(service);transferOrderCheck(service);dev.voxydistant.config.DistantConfig.PLAYER_SEND_MIB.set(32);dev.voxydistant.config.DistantConfig.TOTAL_MBPS.set(8.0);dev.voxydistant.config.DistantConfig.MAX_BATCH_COLUMNS.set(1);System.out.println("DISTANT_BATCH_PASS: 16/128, mixed levels, fragmentation, credit split, tail, repeated requests, stale/abort/epoch and exact budget release");return true;}
         batchCase++;int max=batchCase==2?128:16;expectedBatchColumns=batchCase==2?128:batchCase==4?3:batchCase==5?1:16;
         dev.voxydistant.config.DistantConfig.MAX_BATCH_COLUMNS.set(max);dev.voxydistant.config.DistantConfig.COMPRESSION_LEVEL.set(1);dev.voxydistant.config.DistantConfig.TOTAL_MBPS.set(30.0);
         batchPeer=new Peer(30+batchCase);var type=Class.forName("dev.voxydistant.server.RemoteServer$Session");var ctor=type.getDeclaredConstructor(ServerPlayer.class);ctor.setAccessible(true);Object session=ctor.newInstance(batchPeer.player);sessions.put(batchPeer.player.getUUID(),session);
@@ -343,7 +382,7 @@ public final class ServerSmoke {
         var bands=dev.voxydistant.config.DistanceBands.parse(List.of("32:0","64:1","96:2"));long charge=0;int totalRaw=4;var batchMembers=new ArrayList<Protocol.Member>();
         for(int i=0;i<expectedBatchColumns;i++){
             int x=20+i,level=bands.select(x,0,0,0);var column=new LodColumn(x,0,source.minY(),source.version(),source.states(),source.biomes(),source.sections());byte[] raw=ColumnCodec.encodeRaw(column,1<<level);
-            queue.put(net.minecraft.world.level.ChunkPos.asLong(x,0),readyCtor.newInstance(new Protocol.Member(x,0,column.version(),level,raw.length),raw,-1));charge+=4L*(raw.length+4)+1024;
+            queue.put(net.minecraft.world.level.ChunkPos.asLong(x,0),readyCtor.newInstance(new Protocol.Member(x,0,column.version(),level,raw.length),raw,-1,new RemoteServer.Key(net.minecraft.world.level.Level.OVERWORLD,x,0)));charge+=4L*(raw.length+4)+1024;
             totalRaw+=raw.length+4;batchMembers.add(new Protocol.Member(x,0,column.version(),level,raw.length));
         }
         if(batchCase==3){long full=Protocol.batchReservation(1024,totalRaw,batchMembers,source.sections().length),single=Protocol.batchReservation(1024,batchMembers.getFirst().rawLength()+8,List.of(batchMembers.getFirst()),source.sections().length);int splitLimit=(int)((full+single)/2);capacity.setInt(session,splitLimit);advertised.setInt(session,splitLimit);}
@@ -368,10 +407,56 @@ public final class ServerSmoke {
         flush.invoke(service,System.nanoTime());check(peer.aborts==1&&send.isEmpty()&&!inflight.isEmpty(),"partial stale batch waits for abort receipt");
         RemoteServer.receipt(peer.player,new Protocol.Receipt(1,80002L));check((long)field(s,"reserved")==0,"late receipt cannot double release");
         versions.put(key,version);
+        var large=new ColumnCodec.Encoded(false,4<<20,new byte[4<<20]);
+        long largeCredit=Protocol.batchReservation(large.bytes().length,large.rawLength(),members,c.sections().length);
+        Object streaming=tc.newInstance(80004L,net.minecraft.world.level.Level.OVERWORLD,1,members,large);
+        ((dev.voxydistant.network.ByteBudget)field(service,"totalBudget")).update(System.nanoTime()+1_000_000_000L,3_750_000);
+        ((dev.voxydistant.network.ByteBudget)field(s,"budget")).update(System.nanoTime()+1_000_000_000L,3_750_000);
+        send.add(streaming);bytes.setLong(s,large.bytes().length);bc.setLong(s,largeCredit);
+        flush.invoke(service,System.nanoTime());
+        check(offset.getInt(streaming)>0&&offset.getInt(streaming)<large.bytes().length,"real fragmented batch remains in progress");
+        versions.put(key,version+1);flush.invoke(service,System.nanoTime());
+        check(peer.aborts==2&&send.isEmpty()&&!inflight.isEmpty(),"invalidation between send passes aborts previously validated transfer");
+        RemoteServer.receipt(peer.player,new Protocol.Receipt(1,80004L));check((long)field(s,"reserved")==0,"streaming abort receipt releases credit once");versions.put(key,version);
         send.add(tc.newInstance(80003L,net.minecraft.world.level.Level.OVERWORLD,1,members,data));bytes.setLong(s,data.bytes().length);bc.setLong(s,credit);
         RemoteServer.requests(peer.player,new Protocol.Requests(2,256,2,0,120<<20,List.of()));
         check(send.isEmpty()&&(long)field(s,"bytes")==0&&(long)field(s,"batchCredit")==0,"new epoch clears queued batch");
         RemoteServer.receipt(peer.player,new Protocol.Receipt(1,80003L));check((long)field(s,"reserved")==0,"old epoch receipt ignored");sessions.remove(peer.player.getUUID());
+    }
+    @SuppressWarnings("unchecked") private void transferOrderCheck(Object service)throws ReflectiveOperationException{
+        var sessions=(Map<UUID,Object>)field(service,"players");var peer=new Peer(81);
+        var type=Class.forName("dev.voxydistant.server.RemoteServer$Session");var ctor=type.getDeclaredConstructor(ServerPlayer.class);ctor.setAccessible(true);Object session=ctor.newInstance(peer.player);
+        sessions.put(peer.player.getUUID(),session);
+        var transfer=Class.forName("dev.voxydistant.server.RemoteServer$Transfer");var tc=transfer.getDeclaredConstructor(long.class,net.minecraft.resources.ResourceKey.class,int.class,List.class,ColumnCodec.Encoded.class);tc.setAccessible(true);
+        var offset=transfer.getDeclaredField("offset");offset.setAccessible(true);
+        var select=RemoteServer.class.getDeclaredMethod("selectTransfer",type);select.setAccessible(true);
+        var send=(Deque<Object>)field(session,"send");var shapes=type.getDeclaredField("shape");shapes.setAccessible(true);var order=type.getDeclaredField("sendOrder");order.setAccessible(true);
+        var aged=type.getDeclaredField("lastSendAgedTick");aged.setAccessible(true);
+        var random=new Random(497);int tick=(int)field(service,"ticks");
+        for(int run=0;run<24;run++){
+            double angle=run*.3;var shape=new dev.voxydistant.movement.RequestShape(0,0,.5,.25,Math.cos(angle),Math.sin(angle),run%2,256,256);shapes.set(session,shape);
+            send.clear();order.set(session,null);aged.setInt(session,run%3==0?tick-20:tick);
+            var members=new java.util.IdentityHashMap<Object,List<Protocol.Member>>();
+            for(int i=0;i<64;i++){
+                var list=new ArrayList<Protocol.Member>();for(int m=0;m<8;m++)list.add(new Protocol.Member(random.nextInt(101)-50,random.nextInt(101)-50,1,m%5,i*8L+m+1,1));
+                Object t=tc.newInstance(i+1L,net.minecraft.world.level.Level.OVERWORLD,1,List.copyOf(list),new ColumnCodec.Encoded(false,1,new byte[]{0}));send.add(t);members.put(t,list);
+            }
+            while(!send.isEmpty()){
+                boolean age=tick-aged.getInt(session)>=20;Object expected=send.getFirst();int bestX=0,bestZ=0;boolean found=false;
+                for(Object t:send){
+                    if(age){if((long)field(t,"created")<(long)field(expected,"created"))expected=t;}
+                    else{
+                        var first=members.get(t).getFirst();int x=first.x(),z=first.z();
+                        for(var m:members.get(t))if(shape.compare(m.x(),m.z(),x,z)<0){x=m.x();z=m.z();}
+                        if(!found||shape.compare(x,z,bestX,bestZ)<0){found=true;bestX=x;bestZ=z;expected=t;}
+                    }
+                }
+                select.invoke(service,session);check(send.getFirst()==expected,"transfer heap matches exhaustive aging/directional priority");
+                offset.setInt(expected,1);select.invoke(service,session);check(send.getFirst()==expected,"partial transfer stays at head");send.removeFirst();
+            }
+        }
+        sessions.remove(peer.player.getUUID());
+        System.out.println("DISTANT_TRANSFER_ORDER_PASS: exhaustive mixed-member order, prediction, aging and partial continuity");
     }
     @SuppressWarnings("unchecked") private void benchmark(Object service)throws ReflectiveOperationException{
         benchmark=true;var sessions=(Map<UUID,Object>)field(service,"players");var sessionType=Class.forName("dev.voxydistant.server.RemoteServer$Session");var sessionCtor=sessionType.getDeclaredConstructor(ServerPlayer.class);sessionCtor.setAccessible(true);

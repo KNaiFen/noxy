@@ -35,6 +35,7 @@ import java.nio.file.Files;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
@@ -65,7 +66,8 @@ public final class RemoteServer {
     private DistanceBands parsedBands;
     private List<? extends String> bandSettings=List.of();
     private ConfigChange configChange;
-    private boolean refillQueued;
+    private final ConcurrentLinkedQueue<Runnable> completions=new ConcurrentLinkedQueue<>();
+    private final AtomicBoolean pumpQueued=new AtomicBoolean();
     private record ConfigChange(ServerSettings.Snapshot before, ServerSettings.Snapshot after,
                                 java.util.function.BooleanSupplier allowed, java.util.function.Consumer<String> done) {}
     private boolean reopening;
@@ -81,6 +83,7 @@ public final class RemoteServer {
     private final long started=System.nanoTime();
     private double tokens;
     private int cursor, sendCursor, ticks;
+    private long sendPass;
     private String failure = "", reason = "初始化数据库";
     private final long[] sentLevels = new long[5];
     private final long[] batchFlushes=new long[4]; // full, budget, tail, tick
@@ -171,12 +174,13 @@ public final class RemoteServer {
         int maintenanceResult = 1; // failed until a cache hit, successful write, or skipped input
         Work(Key key, long bytes) { this.key = key; this.bytes = bytes; }
     }
-    private static final class Transfer {
+    private static final class Transfer implements Comparable<Transfer> {
         final long id; final Key key; final int level, epoch; final long version,requestId; final ColumnCodec.Encoded data;
         final int scratchPerSection;
         final List<Protocol.Member> members;
         Set<Protocol.Member> cancelled;
         int offset,fragments;long firstSent; final long created = System.nanoTime();
+        double score;long distance,validatedPass,validatedRevision;int priorityX,priorityZ,order;
         Transfer(long id, Key key, int level, long version, int epoch, long requestId,ColumnCodec.Encoded data) {
             this.id=id; this.key=key; this.level=level; this.version=version; this.epoch=epoch; this.requestId=requestId;this.data=data;
             this.members=List.of();scratchPerSection=37448>>(level*3);
@@ -187,12 +191,17 @@ public final class RemoteServer {
             int finest=level;for(var member:members)finest=Math.min(finest,member.level());scratchPerSection=37448>>(finest*3);
         }
         long reservation(int sections) { return data.bytes().length+data.rawLength()*3L+(long)sections*scratchPerSection+(2L<<20); }
+        public int compareTo(Transfer other){
+            int result=Double.compare(score,other.score);if(result==0)result=Long.compare(distance,other.distance);
+            if(result==0)result=Integer.compare(priorityX,other.priorityX);if(result==0)result=Integer.compare(priorityZ,other.priorityZ);
+            return result==0?Integer.compare(order,other.order):result;
+        }
     }
     private static final class Ready implements Comparable<Ready>{
-        private final Protocol.Member member;private final byte[] raw;private final int tick;
+        private final Protocol.Member member;private final byte[] raw;private final int tick;private final Key key;
         // Only the server thread updates scores while selecting a batch.
         double score;long distance;
-        Ready(Protocol.Member member,byte[] raw,int tick){this.member=member;this.raw=raw;this.tick=tick;}
+        Ready(Protocol.Member member,byte[] raw,int tick,Key key){this.member=member;this.raw=raw;this.tick=tick;this.key=key;}
         Protocol.Member member(){return member;}byte[] raw(){return raw;}int tick(){return tick;}
         long charge(){return 4L*(raw.length+4)+1024;}
         public int compareTo(Ready other){
@@ -221,6 +230,7 @@ public final class RemoteServer {
         dev.voxydistant.movement.RequestShape shape;
         final ServerPlayer player; final PendingRequests pending = new PendingRequests();
         final ArrayDeque<Transfer> send = new ArrayDeque<>(); final Map<Long,Credit> inflight = new HashMap<>();
+        PriorityQueue<Transfer> sendOrder;
         final LinkedHashMap<Long,Ready> ready=new LinkedHashMap<>();
         boolean batching;List<Protocol.Member> encodingMembers;Set<Protocol.Member> encodingCancelled;long batchCredit,encodingBytes;int lastReadyAgedTick,lastSendAgedTick;
         final ByteBudget budget = new ByteBudget();
@@ -292,7 +302,7 @@ public final class RemoteServer {
         for (Work w:work.values()) w.demands.removeIf(d -> {if(d.session!=old)return false;detach(w,d);return true;});
     }
     public static void requests(ServerPlayer player, Protocol.Requests request) {
-        if (instance!=null && !instance.stopping) {instance.accept(player,request);instance.schedule(DistantConfig.serverLimits());}
+        if (instance!=null && !instance.stopping) {instance.accept(player,request);instance.queuePump();}
     }
     private void accept(ServerPlayer player, Protocol.Requests r) {
         if(exclusiveImport()||importStorageFailed)return;
@@ -355,7 +365,7 @@ public final class RemoteServer {
             s.reserved-=t.reservation();
             if(DebugLog.enabled())DebugLog.end(SERVER_CREDIT_ROUND_TRIP,t.created());
             if(DebugLog.verbose())DebugLog.log("SERVER receipt player={} epoch={} transfer={} credit_cycle_ms={} after_submit_ms={} released_bytes={} reserved_bytes={}",player.getUUID(),s.epoch,receipt.transfer(),DebugLog.millis(System.nanoTime()-t.created),t.submitted==0?-1:DebugLog.millis(System.nanoTime()-t.submitted),t.reservation,s.reserved);
-            instance.flushSends(System.nanoTime());instance.schedule(DistantConfig.serverLimits());
+            instance.queuePump();
         }
     }
     public static void markDirty(ServerLevel level,int x,int z) {
@@ -507,17 +517,22 @@ public final class RemoteServer {
             }catch(RuntimeException e){server.execute(()->{indexReading=false;indexFailed=true;fail(new IllegalStateException("服务端启动索引失败；已提交进度保留，下次启动或重开缓存后继续",e));});}
         });
     }
-    // Commit all ready completions before refilling slots once in the server task queue.
-    private void complete(Runnable action){server.execute(()->{
-        if(stopping)return;
-        action.run();
-        if(refillQueued)return;
-        refillQueued=true;
-        server.tell(new net.minecraft.server.TickTask(server.getTickCount(),()->{
-            refillQueued=false;
-            if(!stopping)schedule(DistantConfig.serverLimits());
-        }));
-    });}
+    private void complete(Runnable action){completions.add(action);queuePump();}
+    private void queuePump(){
+        if(pumpQueued.compareAndSet(false,true))server.tell(new net.minecraft.server.TickTask(server.getTickCount(),this::pump));
+    }
+    // One bounded commit pass shares its scheduling and sending work with requests/receipts.
+    private void pump(){
+        try{
+            if(stopping){completions.clear();return;}
+            for(int budget=64;budget>0;budget--){var action=completions.poll();if(action==null)break;action.run();}
+            schedule(DistantConfig.serverLimits());
+            flushSends(System.nanoTime());
+        }finally{
+            pumpQueued.set(false);
+            if(!stopping&&!completions.isEmpty())queuePump();
+        }
+    }
     private boolean foregroundPending(){for(Session session:players.values())if(!session.pending.isEmpty())return true;return false;}
     private boolean foregroundActive(){for(Work active:work.values())if(!active.demands.isEmpty())return true;return false;}
     private void scanBackground(){
@@ -735,7 +750,7 @@ public final class RemoteServer {
         long dx=Math.max(Math.max((long)query.x()*32-player.chunkPosition().x,(long)player.chunkPosition().x-((long)query.x()*32+31)),0),
                 dz=Math.max(Math.max((long)query.z()*32-player.chunkPosition().z,(long)player.chunkPosition().z-((long)query.z()*32+31)),0);
         if(dx*dx+dz*dz>(long)s.radius*s.radius)return;
-        s.directories.put(query.id(),query);self.schedule(DistantConfig.serverLimits());
+        s.directories.put(query.id(),query);self.queuePump();
     }
     private int directoryCursor;
     public static void regionCancel(ServerPlayer player,Protocol.RegionCancel cancel){
@@ -972,7 +987,7 @@ public final class RemoteServer {
                     for(var entry:recipients.entrySet())for(Demand d:entry.getValue()) {
                         Session s=d.session;var data=encodings.get(entry.getKey());
                         if(players.get(s.player.getUUID())!=s || !w.demands.contains(d))continue;
-                        var readyColumn=new Ready(new Protocol.Member(w.key.x,w.key.z,column.version(),entry.getKey(),d.want.requestId(),data.rawLength()),data.bytes(),ticks);
+                        var readyColumn=new Ready(new Protocol.Member(w.key.x,w.key.z,column.version(),entry.getKey(),d.want.requestId(),data.rawLength()),data.bytes(),ticks,w.key);
                         long charge=batch?readyColumn.charge():data.bytes().length;
                         if(s.bytes+s.encodingBytes+s.cacheReadBytes+charge>DistantConfig.PLAYER_SEND_MIB.get()*1048576L || totalQueuedBytes()+charge>DistantConfig.TOTAL_SEND_MIB.get()*1048576L) {reply(s,d.want,1,"send_memory");continue;}
                         if(batch){var previous=s.ready.put(w.key.pos(),readyColumn);if(previous!=null)s.bytes-=previous.charge();}
@@ -980,7 +995,6 @@ public final class RemoteServer {
                         if(DebugLog.verbose())DebugLog.log("SERVER queued player={} epoch={} transfer={} x={} z={} request_id={} level={} payload_bytes={} raw_bytes={} work_ms={}",s.player.getUUID(),s.epoch,transferSequence,w.key.x,w.key.z,d.want.requestId(),entry.getKey(),data.bytes().length,data.rawLength(),(System.nanoTime()-w.started)/1e6);
                     }
                     finish(w,-1);
-                    flushSends(System.nanoTime());
                 });
             }catch(RuntimeException e){complete(() -> {fail(e);finish(w,1);});}
         });
@@ -1042,16 +1056,16 @@ public final class RemoteServer {
         if(exclusiveImport()||importStorageFailed)return;
         if(reopening)return;
         if(s.batching||s.ready.isEmpty())return;
+        int max=DistantConfig.MAX_BATCH_COLUMNS.get(),sections=s.player.level().getSectionsCount(),raw=4;
+        long credit=s.capacity-s.reserved-s.batchCredit,charge=0,reservation=0;
+        // Nothing can enter the receive window; leave pruning until credit is released.
+        if(credit<=0||credit<s.capacity&&credit<(2L<<20)+(long)sections*(37448>>(4*3))+32){s.blocked("batch_credit");return;}
         for(var it=s.ready.values().iterator();it.hasNext();){Ready r=it.next();var m=r.member();
-            if(!inRange(s,m.x(),m.z())||m.version()<versions.getOrDefault(new Key(s.dimension,m.x(),m.z()),0L)){
+            if(!inRange(s,m.x(),m.z())||m.version()<versions.getOrDefault(r.key,0L)){
                 it.remove();s.bytes-=r.charge();reply(s,new Protocol.Want(m.x(),m.z(),m.version(),m.level(),m.requestId()),1,"batch_stale_or_out_of_range");
             }
         }
         if(s.ready.isEmpty())return;
-        int max=DistantConfig.MAX_BATCH_COLUMNS.get(),sections=s.player.level().getSectionsCount(),raw=4;
-        long credit=s.capacity-s.reserved-s.batchCredit,charge=0,reservation=0;
-        // A busy credit window cannot fit even the smallest possible one-column batch.
-        if(credit<s.capacity&&credit<(2L<<20)+(long)sections*(37448>>(4*3))+32){s.blocked("batch_credit");return;}
         var members=new ArrayList<Protocol.Member>();var columns=new ArrayList<byte[]>();
         var center=s.player.chunkPosition();var ranked=new ArrayList<Ready>(s.ready.size());
         boolean age=ticks-s.lastReadyAgedTick>=20;
@@ -1084,12 +1098,11 @@ public final class RemoteServer {
                                 var cancelled=s.encodingCancelled;s.batching=false;s.encodingMembers=null;s.encodingCancelled=null;
                                 s.encodingBytes-=held;batchMemory-=held;
                                 if(players.get(s.player.getUUID())!=s||s.epoch!=epoch)return;
-                                if(cancelled!=null&&cancelled.contains(m)){flushBatch(s);return;}
+                                if(cancelled!=null&&cancelled.contains(m))return;
                                 var want=new Protocol.Want(m.x(),m.z(),m.version(),m.level(),m.requestId());
                                 if(!inRange(s,m.x(),m.z())||m.version()<versions.getOrDefault(new Key(s.dimension,m.x(),m.z()),0L))reply(s,want,1,"single_stale_or_out_of_range");
                                 else if(Protocol.reservation(data.bytes().length,data.rawLength(),m.level(),sections)>s.capacity)reply(s,want,3,"receive_budget");
                                 else{s.send.add(new Transfer(++transferSequence,new Key(s.dimension,m.x(),m.z()),m.level(),m.version(),epoch,m.requestId(),data));s.bytes+=data.bytes().length;}
-                                flushSends(System.nanoTime());
                             });
                         }catch(RuntimeException e){complete(()->{
                             s.batching=false;s.encodingMembers=null;s.encodingCancelled=null;
@@ -1124,15 +1137,14 @@ public final class RemoteServer {
                     DebugLog.end(SERVER_COMPLETION,ready);
                     var cancelled=s.encodingCancelled;s.batching=false;s.encodingMembers=null;s.encodingCancelled=null;
                     s.encodingBytes-=held;batchMemory-=held;
-                    if(players.get(s.player.getUUID())!=s||s.epoch!=epoch){if(players.get(s.player.getUUID())==s)flushBatch(s);return;}
+                    if(players.get(s.player.getUUID())!=s||s.epoch!=epoch)return;
                     s.batchCredit-=heldCredit;
-                    if(cancelled!=null&&cancelled.size()==metadata.size()){flushBatch(s);return;}
+                    if(cancelled!=null&&cancelled.size()==metadata.size())return;
                     s.bytes+=data.bytes().length;
                     var transfer=new Transfer(++transferSequence,s.dimension,epoch,metadata,data);
                     transfer.cancelled=cancelled;
                     if(DebugLog.verbose())DebugLog.log("SERVER encoded player={} epoch={} transfer={} columns={} raw_bytes={} payload_bytes={} encode_ms={}",s.player.getUUID(),epoch,transfer.id,metadata.size(),data.rawLength(),data.bytes().length,DebugLog.millis(encoded));
                     s.batchCredit+=transfer.reservation(sections);s.send.add(transfer);
-                    flushSends(System.nanoTime());
                 });
             }catch(RuntimeException e){complete(()->{
                 s.batching=false;s.encodingMembers=null;s.encodingCancelled=null;
@@ -1223,28 +1235,41 @@ public final class RemoteServer {
     private int creditLimit(Session s){return Math.min(s.advertisedCapacity,(int)Math.min(Integer.MAX_VALUE,DistantConfig.PLAYER_SEND_MIB.get()*1048576L*4));}
     private static long distance(ChunkPos center,int x,int z){long dx=(long)x-center.x,dz=(long)z-center.z;return dx*dx+dz*dz;}
     private static double priority(Session s,int x,int z){return s.shape==null?distance(s.player.chunkPosition(),x,z):s.shape.score(x,z);}
-    private static int compare(Session s,int x,int z,int otherX,int otherZ){
-        int order=Double.compare(priority(s,x,z),priority(s,otherX,otherZ));var player=s.player.chunkPosition();
-        if(order==0)order=Long.compare(distance(player,x,z),distance(player,otherX,otherZ));
-        if(order==0)order=Integer.compare(x,otherX);return order==0?Integer.compare(z,otherZ):order;
-    }
     private void selectTransfer(Session s){
         Transfer head=s.send.peek();if(head==null||head.offset!=0)return;
-        Transfer chosen=head;boolean age=ticks-s.lastSendAgedTick>=20;boolean found=false;int bestX=0,bestZ=0;
-        for(var candidate:s.send){
-            if(age){if(candidate.created<chosen.created)chosen=candidate;}
-            else {int x=candidate.key.x,z=candidate.key.z;
-                for(var m:candidate.members)if(compare(s,m.x(),m.z(),x,z)<0){x=m.x();z=m.z();}
-                if(!found||compare(s,x,z,bestX,bestZ)<0){found=true;bestX=x;bestZ=z;chosen=candidate;}}
+        if(s.send.size()==1){if(ticks-s.lastSendAgedTick>=20)s.lastSendAgedTick=ticks;return;}
+        Transfer chosen=head;boolean age=ticks-s.lastSendAgedTick>=20;
+        if(age){
+            for(var candidate:s.send)if(candidate.created<chosen.created)chosen=candidate;
+            s.lastSendAgedTick=ticks;s.sendOrder=null;
+        }else{
+            if(s.sendOrder==null){
+                var ranked=new ArrayList<Transfer>(s.send.size());var center=s.player.chunkPosition();int order=0;
+                for(var candidate:s.send){
+                    candidate.priorityX=candidate.key.x;candidate.priorityZ=candidate.key.z;
+                    candidate.score=priority(s,candidate.priorityX,candidate.priorityZ);candidate.distance=distance(center,candidate.priorityX,candidate.priorityZ);candidate.order=order++;
+                    for(int i=1;i<candidate.members.size();i++){
+                        var m=candidate.members.get(i);double score=priority(s,m.x(),m.z());long distance=distance(center,m.x(),m.z());
+                        int result=Double.compare(score,candidate.score);if(result==0)result=Long.compare(distance,candidate.distance);
+                        if(result==0)result=Integer.compare(m.x(),candidate.priorityX);if(result==0)result=Integer.compare(m.z(),candidate.priorityZ);
+                        if(result<0){candidate.score=score;candidate.distance=distance;candidate.priorityX=m.x();candidate.priorityZ=m.z();}
+                    }
+                    ranked.add(candidate);
+                }
+                s.sendOrder=new PriorityQueue<>(ranked);
+            }
+            while(s.sendOrder.peek().offset!=0)s.sendOrder.remove();
+            chosen=s.sendOrder.peek();
         }
-        if(age)s.lastSendAgedTick=ticks;
         if(chosen!=head){s.send.remove(chosen);s.send.addFirst(chosen);}
     }
     private void flushSends(long now) {
         if(exclusiveImport()||importStorageFailed)return;
         totalBudget.update(now,DistantConfig.TOTAL_MBPS.get()*1_000_000/8);
+        long pass=++sendPass;
         var sessions=new ArrayList<>(players.values());int attempts=0,idle=0;
         for(Session s:sessions) {
+            s.sendOrder=null;
             s.capacity=creditLimit(s);
             flushBatch(s);
             double cap=DistantConfig.TOTAL_MBPS.get()*1_000_000/8;
@@ -1263,8 +1288,14 @@ public final class RemoteServer {
             }
             selectTransfer(s);Transfer t=s.send.peek();if(t==null)continue;
             var inflightCredit=s.inflight.get(t.id);var cancelled=inflightCredit==null?t.cancelled:inflightCredit.cancelled;
-            boolean stale=t.members.isEmpty()?(!inRange(s,t.key.x,t.key.z)||t.version<versions.getOrDefault(t.key,0L)):t.members.stream().anyMatch(m->(cancelled==null||!cancelled.contains(m))&&(!inRange(s,m.x(),m.z())||m.version()<versions.getOrDefault(new Key(s.dimension,m.x(),m.z()),0L)));
-            if(stale||t.epoch!=s.epoch){if(DebugLog.verbose())DebugLog.log("SERVER discard player={} epoch={} transfer={} offset={} reason={}",s.player.getUUID(),t.epoch,t.id,t.offset,stale?"stale":"epoch");s.send.remove();s.bytes-=t.data.bytes().length;if(t.offset>0){var credit=s.inflight.get(t.id);if(credit!=null)credit.aborting=true;Protocol.send(s.player,new Protocol.Abort(t.epoch,t.id));}else if(t.members.isEmpty()){
+            boolean stale=false;long revision=sequence.get();
+            // The server owns world/session mutations; fragments in one pass share validation.
+            if(t.validatedPass!=pass||t.validatedRevision!=revision){
+                if(t.members.isEmpty())stale=!inRange(s,t.key.x,t.key.z)||t.version<versions.getOrDefault(t.key,0L);
+                else for(var m:t.members)if((cancelled==null||!cancelled.contains(m))&&(!inRange(s,m.x(),m.z())||m.version()<versions.getOrDefault(new Key(s.dimension,m.x(),m.z()),0L))){stale=true;break;}
+                t.validatedPass=pass;t.validatedRevision=revision;
+            }
+            if(stale||t.epoch!=s.epoch){if(DebugLog.verbose())DebugLog.log("SERVER discard player={} epoch={} transfer={} offset={} reason={}",s.player.getUUID(),t.epoch,t.id,t.offset,stale?"stale":"epoch");s.send.remove();if(s.sendOrder!=null)s.sendOrder.remove(t);s.bytes-=t.data.bytes().length;if(t.offset>0){var credit=s.inflight.get(t.id);if(credit!=null)credit.aborting=true;Protocol.send(s.player,new Protocol.Abort(t.epoch,t.id));}else if(t.members.isEmpty()){
                 if(t.epoch==s.epoch)reply(s,new Protocol.Want(t.key.x,t.key.z,t.version,t.level,t.requestId),1,"transfer_stale");
             }else{s.batchCredit-=t.reservation(s.player.level().getSectionsCount());for(var m:t.members)reply(s,new Protocol.Want(m.x(),m.z(),m.version(),m.level(),m.requestId()),1,"transfer_stale");}idle=0;continue;}
             long reservation=t.reservation(s.player.level().getSectionsCount());
@@ -1272,7 +1303,7 @@ public final class RemoteServer {
             // New single-column transfers always obey the current effective credit.
             long sendCapacity=t.members.isEmpty()?s.capacity:Math.max(s.capacity,Math.min(s.advertisedCapacity,reservation));
             if(t.offset==0 && reservation>sendCapacity && t.members.isEmpty()){
-                s.send.remove();s.bytes-=t.data.bytes().length;
+                s.send.remove();if(s.sendOrder!=null)s.sendOrder.remove(t);s.bytes-=t.data.bytes().length;
                 reply(s,new Protocol.Want(t.key.x,t.key.z,t.version,t.level,t.requestId),3,"receive_budget");idle=0;continue;
             }
             if(t.offset==0 && s.reserved+reservation>sendCapacity){DebugLog.count(SERVER_CREDIT_BLOCK);s.blocked("send_credit");continue;}
@@ -1284,9 +1315,8 @@ public final class RemoteServer {
                 t.firstSent=System.nanoTime();s.reserved+=reservation;if(!t.members.isEmpty())s.batchCredit-=reservation;s.inflight.put(t.id,new Credit(reservation,t.firstSent,t));
                 if(DebugLog.verbose())DebugLog.log("SERVER send_begin player={} world={} dimension={} epoch={} transfer={} columns={} payload_bytes={} raw_bytes={} queue_ms={} reservation={}",s.player.getUUID(),world,s.dimension.location(),t.epoch,t.id,t.members.isEmpty()?1:t.members.size(),t.data.bytes().length,t.data.rawLength(),DebugLog.millis(t.firstSent-t.created),reservation);
             }
-            byte[] bytes=Arrays.copyOfRange(t.data.bytes(),t.offset,t.offset+size);
-            if(t.members.isEmpty())Protocol.send(s.player,new Protocol.Fragment(t.epoch,t.id,t.key.x,t.key.z,t.version,t.level,t.requestId,t.data.compressed(),t.data.rawLength(),t.data.bytes().length,t.offset,bytes));
-            else Protocol.send(s.player,new Protocol.BatchFragment(t.epoch,t.id,t.data.compressed(),t.data.rawLength(),t.data.bytes().length,t.offset,t.offset==0?t.members:List.of(),bytes));
+            if(t.members.isEmpty())Protocol.send(s.player,new Protocol.Fragment(t.epoch,t.id,t.key.x,t.key.z,t.version,t.level,t.requestId,t.data.compressed(),t.data.rawLength(),t.data.bytes().length,t.offset,t.data.bytes(),t.offset,size));
+            else Protocol.send(s.player,new Protocol.BatchFragment(t.epoch,t.id,t.data.compressed(),t.data.rawLength(),t.data.bytes().length,t.offset,t.offset==0?t.members:List.of(),t.data.bytes(),t.offset,size));
             idle=0;
             t.offset+=size;t.fragments++;s.payload+=size;s.deficit-=size+overhead;totalBudget.spend(size+overhead);s.budget.spend(size+overhead);sentBytes+=size+overhead;s.sent+=size+overhead;
             if(t.members.isEmpty())sentLevels[t.level]+=size+overhead;
@@ -1298,6 +1328,7 @@ public final class RemoteServer {
             if(s.deficit>128&&!s.send.isEmpty())sendCursor--;
         }
         if(DebugLog.enabled()&&totalBudget.available()<=128&&sessions.stream().anyMatch(s->!s.send.isEmpty()))DebugLog.count(SERVER_TOTAL_BANDWIDTH_BLOCK);
+        for(Session s:sessions)s.sendOrder=null;
     }
     private void fail(RuntimeException e){failure=e.toString();LOG.error("Voxy Distant server task failed",e);}
     public static String status(){var s=instance;return s==null?"服务端未启动":String.format(Locale.ROOT,"TPS %.1f / MSPT %.1f · 原版 %d · 读缓存 %d · 生成 %d · 完成 %d · 缓存 %d/%d · 内存 %.1f MiB · 发送 %.1f MiB · 生成调度：%s%s",s.governor.tps(),s.server.getAverageTickTime(),PriorityState.foregroundPending(),s.cacheActive,s.generationActive,s.completed,s.hits,s.hits+s.misses,s.memory/1048576.0,s.sentBytes/1048576.0,s.reason,s.failure.isEmpty()?"":" · "+s.failure);}
@@ -1340,7 +1371,7 @@ public final class RemoteServer {
     }
     private void advanceConfigChange() {
         if(exclusiveImport() && maintenance.importWorkers!=null && !maintenance.importWorkers.isTerminated())return;
-        if(!work.isEmpty()||dirtyWrites.get()!=0||workers.getActiveCount()!=0||!workers.getQueue().isEmpty()||batchMemory!=0)return;
+        if(!work.isEmpty()||dirtyWrites.get()!=0||workers.getActiveCount()!=0||!workers.getQueue().isEmpty()||batchMemory!=0||!completions.isEmpty())return;
         var change=configChange;
         if(!change.allowed.getAsBoolean()){finishConfigChange("权限已撤销或连接已断开");return;}
         if(!importStorageFailed&&change.after.get(DistantConfig.SERVER_CACHE_MIB).equals(change.before.get(DistantConfig.SERVER_CACHE_MIB))){finishConfigChange(null);return;}
@@ -1417,7 +1448,7 @@ public final class RemoteServer {
         if(maintenancePaused)return;
         if(task.cancelled&&task.phase.equals("准备")){completeMaintenance(task);return;}
         if(task.phase.equals("准备")){
-            if(!work.isEmpty()||workers.getActiveCount()!=0||!workers.getQueue().isEmpty()||batchMemory!=0)return;
+            if(!work.isEmpty()||workers.getActiveCount()!=0||!workers.getQueue().isEmpty()||batchMemory!=0||!completions.isEmpty())return;
             for(Session s:players.values()){
                 s.pending.clear();s.latestRequestIds.clear();s.ready.clear();s.send.clear();s.inflight.clear();
                 s.bytes=s.reserved=s.batchCredit=s.encodingBytes=0;s.active=0;
@@ -1585,6 +1616,7 @@ public final class RemoteServer {
         s.workers.shutdown();
         try{while(!s.workers.awaitTermination(1,TimeUnit.SECONDS))LOG.debug("Waiting for server LOD writes");}
         catch(InterruptedException ex){Thread.currentThread().interrupt();throw new IllegalStateException(ex);}
+        s.completions.clear();
         s.indexReaders.shutdown();
         if(scanner!=null)try{scanner.join();}catch(InterruptedException ex){Thread.currentThread().interrupt();throw new IllegalStateException(ex);}
         if(s.maintenance!=null){s.maintenance.queue.clear();s.maintenance.pending.clear();s.maintenance.active=0;}

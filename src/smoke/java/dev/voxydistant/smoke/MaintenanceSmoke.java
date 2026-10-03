@@ -171,6 +171,7 @@ public final class MaintenanceSmoke {
             fixtures();
             // Start import while an online cache read owns session counters.
             RemoteServer.requests(peer.player,new Protocol.Requests(1,96,2,0,32<<20,List.of(new Protocol.Want(X,Z,0,5))));
+            var pump=RemoteServer.class.getDeclaredMethod("pump");pump.setAccessible(true);pump.invoke(service);
             check(!work.isEmpty(),"online work exists before import");
             command("voxydistant import");task=field(service,"maintenance");command("voxydistant pregen 1 0 0");
             Object session=sessions.get(peer.player.getUUID());

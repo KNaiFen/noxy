@@ -41,14 +41,18 @@ public final class Protocol {
         public Requests(int epoch,int radius,int view,int bandwidth,int capacity,List<Want> wants){this(epoch,radius,view,bandwidth,capacity,wants,List.of());}
     }
     public record Fragment(int epoch, long transfer, int x, int z, long version, int level, long requestId, boolean compressed,
-                           int rawLength, int totalLength, int offset, byte[] bytes) {}
+                           int rawLength, int totalLength, int offset, byte[] bytes,int payloadOffset,int payloadLength) {
+        public Fragment(int epoch,long transfer,int x,int z,long version,int level,long requestId,boolean compressed,int rawLength,int totalLength,int offset,byte[] bytes){this(epoch,transfer,x,z,version,level,requestId,compressed,rawLength,totalLength,offset,bytes,0,bytes.length);}
+    }
     public record Reply(int epoch, int x, int z, long version, int level, long requestId, int status) { // 0 current, 1 retry, 2 unavailable, 3 receive budget too small
         public Reply(int epoch,int x,int z,long version,int level,int status){this(epoch,x,z,version,level,0,status);}
     }
     public record Member(int x,int z,long version,int level,long requestId,int rawLength) {
         public Member(int x,int z,long version,int level,int rawLength){this(x,z,version,level,0,rawLength);}
     }
-    public record BatchFragment(int epoch,long transfer,boolean compressed,int rawLength,int totalLength,int offset,List<Member> members,byte[] bytes) {}
+    public record BatchFragment(int epoch,long transfer,boolean compressed,int rawLength,int totalLength,int offset,List<Member> members,byte[] bytes,int payloadOffset,int payloadLength) {
+        public BatchFragment(int epoch,long transfer,boolean compressed,int rawLength,int totalLength,int offset,List<Member> members,byte[] bytes){this(epoch,transfer,compressed,rawLength,totalLength,offset,members,bytes,0,bytes.length);}
+    }
     public record Receipt(int epoch, long transfer) {}
     public record Abort(int epoch,long transfer) {}
     public record Dirty(String dimension,int x, int z, long version, boolean vanilla) {}
@@ -92,7 +96,7 @@ public final class Protocol {
         }, (m,c) -> { var ctx=c.get(); long queued=DebugLog.start();ctx.enqueueWork(() -> {DebugLog.end(DebugLog.Metric.SERVER_REQUEST_CONTROL,queued);RemoteServer.requests(ctx.getSender(),m);}); ctx.setPacketHandled(true); }, Optional.of(NetworkDirection.PLAY_TO_SERVER));
         CHANNEL.registerMessage(2, Fragment.class, (m,b) -> {
             b.writeInt(m.epoch); b.writeLong(m.transfer); b.writeInt(m.x); b.writeInt(m.z); b.writeLong(m.version); b.writeByte(m.level);
-            b.writeLong(m.requestId);b.writeBoolean(m.compressed); b.writeInt(m.rawLength); b.writeInt(m.totalLength); b.writeInt(m.offset); b.writeByteArray(m.bytes);
+            b.writeLong(m.requestId);b.writeBoolean(m.compressed); b.writeInt(m.rawLength); b.writeInt(m.totalLength); b.writeInt(m.offset); b.writeVarInt(m.payloadLength);b.writeBytes(m.bytes,m.payloadOffset,m.payloadLength);
         }, b -> new Fragment(b.readInt(),b.readLong(),b.readInt(),b.readInt(),b.readLong(),b.readUnsignedByte(),b.readLong(),b.readBoolean(),
                 b.readInt(),b.readInt(),b.readInt(),b.readByteArray(FRAGMENT_BYTES)), (m,c) -> {
             // Queue only; decoding and applying happen in the bounded client worker.
@@ -143,7 +147,7 @@ public final class Protocol {
     public static void writeBatch(BatchFragment m,FriendlyByteBuf b) {
         b.writeInt(m.epoch);b.writeLong(m.transfer);b.writeBoolean(m.compressed);b.writeInt(m.rawLength);b.writeInt(m.totalLength);b.writeInt(m.offset);
         if(m.offset==0){b.writeVarInt(m.members.size());for(Member c:m.members){b.writeInt(c.x);b.writeInt(c.z);b.writeLong(c.version);b.writeByte(c.level);b.writeLong(c.requestId);b.writeInt(c.rawLength);}}
-        b.writeByteArray(m.bytes);
+        b.writeVarInt(m.payloadLength);b.writeBytes(m.bytes,m.payloadOffset,m.payloadLength);
     }
     public static BatchFragment readBatch(FriendlyByteBuf b) {
         int epoch=b.readInt();long transfer=b.readLong();boolean compressed=b.readBoolean();int raw=b.readInt(),total=b.readInt(),offset=b.readInt();
