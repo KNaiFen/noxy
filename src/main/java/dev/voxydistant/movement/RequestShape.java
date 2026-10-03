@@ -19,6 +19,32 @@ public record RequestShape(int playerX,int playerZ,double centerX,double centerZ
         double side=1-.5*amount,front=1+.5*amount;
         return centerX+2*amount*dz*directionX*directionZ/(directionX*directionX*side*side+directionZ*directionZ*front*front);
     }
+    /** Project the footprint within a horizontal slab. The limit circle is clipped separately. */
+    public boolean spanX(double z0,double z1,int reach,double[] result){
+        if(reach<=0)return false;
+        double side=1-.5*amount,front=1+.5*amount,ss=side*side,ff=front*front;
+        double horizontal=ss*directionX*directionX+ff*directionZ*directionZ;
+        double vertical=ff*directionX*directionX+ss*directionZ*directionZ;
+        double sideRadius=reach*side,frontZ=reach*Math.sqrt(horizontal);
+        z0=Math.max(z0,centerZ-(directionZ<0?frontZ:sideRadius));
+        z1=Math.min(z1,centerZ+(directionZ>0?frontZ:sideRadius));
+        if(z0>z1)return false;
+        double slope=(ff-ss)*directionX*directionZ/horizontal;
+        result[0]=Double.POSITIVE_INFINITY;result[1]=Double.NEGATIVE_INFINITY;
+        for(int i=0;i<(z0==z1?1:2);i++){
+            double dz=(i==0?z0:z1)-centerZ,center=slope*dz;
+            double half=Math.sqrt(Math.max(0,ss*ff/horizontal*((double)reach*reach-dz*dz/horizontal)));
+            double left=center-half,right=center+half;
+            if(left*directionX+dz*directionZ<0)left=-Math.sqrt(Math.max(0,sideRadius*sideRadius-dz*dz));
+            if(right*directionX+dz*directionZ<0)right=Math.sqrt(Math.max(0,sideRadius*sideRadius-dz*dz));
+            result[0]=Math.min(result[0],centerX+left);result[1]=Math.max(result[1],centerX+right);
+        }
+        double frontX=reach*Math.sqrt(vertical),supportZ=reach*(ff-ss)*directionX*directionZ/Math.sqrt(vertical);
+        double leftZ=centerZ-(directionX<0?supportZ:0),rightZ=centerZ+(directionX>0?supportZ:0);
+        if(leftZ>=z0&&leftZ<=z1)result[0]=Math.min(result[0],centerX-(directionX<0?frontX:sideRadius));
+        if(rightZ>=z0&&rightZ<=z1)result[1]=Math.max(result[1],centerX+(directionX>0?frontX:sideRadius));
+        return true;
+    }
     public int compare(int x,int z,int otherX,int otherZ){
         int order=Double.compare(score(x,z),score(otherX,otherZ));
         if(order==0)order=Double.compare(actualDistance(x,z),actualDistance(otherX,otherZ));

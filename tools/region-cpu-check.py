@@ -13,6 +13,9 @@ root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument('--baseline', type=Path, default=root / 'build/client-cpu-baseline')
 parser.add_argument('--runs', type=int, default=100)
+parser.add_argument('--warmup', type=int, default=10)
+parser.add_argument('--phases', action='store_true')
+parser.add_argument('--output', type=Path, default=root / 'build/region-cpu-comparison.json')
 options = parser.parse_args()
 args = json.loads((root / 'build/benchmarks/lod-square256-cache128/client-launch.json').read_text())['args']
 java = Path(args[0])
@@ -27,8 +30,11 @@ for variant, checkout in [('baseline', options.baseline.resolve()), ('current', 
                     str(root / 'tools/RegionCpuCheck.java')], check=True)
     results[variant] = {}
     for mode in ('axis', 'diagonal', 'turns', 'replies'):
-        run = subprocess.run([str(java), '-cp', str(output) + ';' + str(classes) + ';' + classpath,
-                              'dev.voxydistant.client.RegionCpuCheck', mode, str(options.runs)],
+        command = [str(java), '-cp', str(output) + ';' + str(classes) + ';' + classpath,
+                   'dev.voxydistant.client.RegionCpuCheck', mode, str(options.runs), str(options.warmup)]
+        if options.phases:
+            command.append('phases')
+        run = subprocess.run(command,
                              check=True, capture_output=True, text=True)
         print(variant, run.stdout.strip(), flush=True)
         (output / (mode + '-result.log')).write_text(run.stdout)
@@ -41,4 +47,4 @@ for mode in results['baseline']:
         if before[key] != after[key]:
             raise AssertionError(f'{mode} changed {key}: {before[key]} -> {after[key]}')
     print(f'{mode}: CPU reduction {100 * (1 - after["cpu_ms"] / before["cpu_ms"]):.2f}%', flush=True)
-(root / 'build/region-cpu-comparison.json').write_text(json.dumps(results, indent=2))
+options.output.write_text(json.dumps(results, indent=2))
