@@ -19,16 +19,18 @@ import net.minecraft.world.level.chunk.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.nio.file.Files;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 
-/** Single ordered apply lane, bounded by reserved decoded memory. Main thread owns requests only. */
+/** One background lane owns reception and requests; main-thread hooks only publish intent and capture vanilla data. */
 public final class RemoteClient {
     private static final org.slf4j.Logger LOG=LogUtils.getLogger();
     private static volatile Session session;
-    private static Protocol.Hello greeting;
-    private static int sequence;
+    private static volatile Protocol.Hello greeting;
+    private static final java.util.concurrent.atomic.AtomicInteger sequence=new java.util.concurrent.atomic.AtomicInteger();
     private static final List<Session> retired=new ArrayList<>();
     private static volatile String failure="";
     private static volatile boolean maintenancePaused;
@@ -41,19 +43,23 @@ public final class RemoteClient {
     private static String localCacheWorld;
     private static CompletableFuture<?> localCacheTask;
     public static void maintenance(Protocol.Maintenance message) {
+        Session s=session;
         if(maintenancePaused==message.paused())return;
         maintenancePaused=message.paused();
-        Session s=session;if(s==null)return;
-        s.epoch=++sequence;s.generation++;s.pending.clear();s.checked.clear();s.invalid.clear();s.retries.clear();s.fullRetry.clear();s.deferredDirty.clear();s.deferredReplies.clear();s.deferredSnapshots.clear();
+        if(s!=null)s.receive(()->maintenance(s,message.paused()));
+    }
+    private static void maintenance(Session s,boolean paused){
+        if(s.closed)return;
+        s.epoch=sequence.incrementAndGet();s.generation++;s.pending.clear();s.checked.clear();s.invalid.clear();s.retries.clear();s.fullRetry.clear();
         synchronized(s.assemblies){
             for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();
             for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();
             s.discardedBatches.clear();
         }
         s.x=Integer.MIN_VALUE;s.discovery.reset();s.regionQueries.clear();
-        if(!maintenancePaused)s.fullRetry.addAll(s.versions.keySet());
+        if(!paused)s.fullRetry.addAll(s.versions.keySet());
     }
-    private static final Map<Long,Long> initialVersions=new HashMap<>();
+    private static final Map<Long,Long> initialVersions=new ConcurrentHashMap<>();
     private static final class Assembly {
         final Protocol.Fragment header;final byte[] bytes;final long reservation;final DebugLog.ReceiveTrace trace;int offset;
         Assembly(Protocol.Fragment f,long reservation){header=f;bytes=new byte[f.totalLength()];this.reservation=reservation;trace=new DebugLog.ReceiveTrace(f.epoch(),f.transfer());}
@@ -70,14 +76,14 @@ public final class RemoteClient {
         private final long started,id;private final int desired,generation;
         private CoverageStore.Stamp before=new CoverageStore.Stamp(0,5);
         private long dirtyBefore;
-        private volatile boolean sent,receiving,applying;
-        private volatile long lastProgress,transfer;
+        private boolean sent,receiving,applying;
+        private long lastProgress,transfer;
         Pending(long started,int desired,int generation,long id){this.started=started;this.lastProgress=started;this.desired=desired;this.generation=generation;this.id=id;}
         long started(){return started;}int desired(){return desired;}int generation(){return generation;}long id(){return id;}
     }
     private static final class Session {
-        final WorldEngine engine;final net.minecraft.client.multiplayer.ClientLevel level;final Protocol.Hello hello;
-        final ThreadPoolExecutor worker=new ThreadPoolExecutor(1,1,0,TimeUnit.SECONDS,new ArrayBlockingQueue<>(512),r->{var t=new Thread(r,"Voxy Distant receive");t.setDaemon(true);return t;},(task,executor)->{
+        final WorldEngine engine;final net.minecraft.client.multiplayer.ClientLevel level;final Protocol.Hello hello;final net.minecraft.core.RegistryAccess registries;
+        final ThreadPoolExecutor worker=new ThreadPoolExecutor(1,1,0,TimeUnit.SECONDS,new ArrayBlockingQueue<>(512),r->{var t=new Thread(r,"Voxy Distant receive");t.setDaemon(true);t.setPriority(Thread.MIN_PRIORITY);return t;},(task,executor)->{
             if(executor.isShutdown())throw new RejectedExecutionException("LOD receive worker is shut down");
             // Preserve the single apply lane and its ordering when a burst fills the bounded queue.
             try{while(!executor.getQueue().offer(task,100,TimeUnit.MILLISECONDS)){
@@ -100,32 +106,43 @@ public final class RemoteClient {
         final Set<Long> loadedFull=ConcurrentHashMap.newKeySet();
         final Map<Long,Integer> checked=new HashMap<>();
         final Set<Long> invalid=new LinkedHashSet<>();
-        final Map<Long,Integer> budgetInsufficient=new HashMap<>();
+        final Map<Long,Integer> budgetInsufficient=new ConcurrentHashMap<>();
         final RetryQueue retries=new RetryQueue();
-        final Set<Long> fullRetry=new LinkedHashSet<>();
-        final Map<Long,Long> deferredDirty=new LinkedHashMap<>();
-        final ArrayDeque<Protocol.Reply> deferredReplies=new ArrayDeque<>();
-        final Set<Long> deferredSnapshots=ConcurrentHashMap.newKeySet();
+        final Set<Long> fullRetry=ConcurrentHashMap.newKeySet();
+        final Set<Long> vanillaDirty=ConcurrentHashMap.newKeySet();
+        final Set<Long> captureRequested=ConcurrentHashMap.newKeySet(),unloaded=ConcurrentHashMap.newKeySet();
+        final LinkedHashMap<Long,Integer> captures=new LinkedHashMap<>();
+        final LinkedHashSet<Long> sectionCaptures=new LinkedHashSet<>();
         final ConcurrentHashMap<Long,ChunkSnapshot> latestSnapshots=new ConcurrentHashMap<>();
-        boolean checkpointPending;
-        boolean activePending;int activeX,activeZ,activeRadius;
-        final DistanceBands bands;volatile int epoch=++sequence;volatile boolean closed;
+        final AtomicReference<Frame> frame=new AtomicReference<>();
+        final AtomicBoolean tickQueued=new AtomicBoolean();
+        Frame input;
+        volatile boolean scanning;
+        volatile int invalidCount,retryCount;
+        volatile String receiveSpeed="接收速度：初始化中…",indexStatus="覆盖索引：初始化中…";
+        final DistanceBands bands;volatile int epoch=sequence.incrementAndGet();volatile boolean closed;
         final RegionDiscovery discovery;
         dev.voxydistant.movement.RequestShape shape;
         long movementRevision=-1;
         final Map<Long,RegionRequest> regionQueries=new LinkedHashMap<>();
-        boolean preparingDirectory;int directoryTick=-1;
-        int x=Integer.MIN_VALUE,z,radius,requestedRadius,view,ticks,generation,requestBudget,preempted,indexMiB=DistantConfig.INDEX_MIB.get(),lastPressureTick=-200;volatile long applied,received;long requestSequence,regionSequence;
+        int directoryTick=-1;
+        int x=Integer.MIN_VALUE,z,ticks,generation,requestBudget,preempted,indexMiB=DistantConfig.INDEX_MIB.get(),lastPressureTick=-200;
+        volatile int view,radius,requestedRadius;volatile long applied,received;long requestSequence,regionSequence;
         boolean refillQueued;
         long debugAt,requestIdleAt;String requestState="initializing";
         long rateAt,rateBytes,rateColumns;double receiveKiBPerSecond,receiveColumnsPerSecond;
         long debugReceived,debugApplied,debugTicks;
         final Map<String,Integer> requestStates=new LinkedHashMap<>();
-        Session(WorldEngine engine,net.minecraft.client.multiplayer.ClientLevel level,Protocol.Hello hello){this.engine=engine;this.level=level;this.hello=hello;bands=DistanceBands.parse(hello.bands());discovery=new RegionDiscovery(bands);VoxyBridge.coverage(engine).remote(hello.minY(),hello.maxY(),DistantConfig.INDEX_MIB.get());}
+        Session(WorldEngine engine,net.minecraft.client.multiplayer.ClientLevel level,Protocol.Hello hello){this.engine=engine;this.level=level;this.hello=hello;registries=level.registryAccess();bands=DistanceBands.parse(hello.bands());discovery=new RegionDiscovery(bands);}
         // Start the single ordered lane before offering, without waiting for queue space.
         boolean offer(Runnable task){worker.prestartCoreThread();return !worker.isShutdown()&&worker.getQueue().offer(task);}
+        void receive(Runnable task){
+            if(closed)return;
+            try{worker.execute(task);}catch(RejectedExecutionException e){if(!closed)throw e;}
+        }
     }
-    public static UUID worldId(){return greeting==null?null:greeting.world();}
+    private record Frame(int x,int z,int view,int requested,int renderRadius,boolean paused){}
+    public static UUID worldId(){var hello=greeting;return hello==null?null:hello.world();}
     public static Protocol.Hello greeting(){return greeting;}
     public static void hello(Protocol.Hello hello) {
         ColumnCodec.bounded(hello.radius(),1,2048);ColumnCodec.bounded(hello.minY(),-256,255);ColumnCodec.bounded(hello.maxY(),hello.minY()+1,256);
@@ -147,15 +164,28 @@ public final class RemoteClient {
         if(greeting==null)return;
         if(maintenancePaused&&mc.player.tickCount%20==0)mc.gui.setOverlayMessage(net.minecraft.network.chat.Component.literal("服务端正在导入远景"),false);
         if(!mc.level.dimension().location().toString().equals(greeting.dimension()))return;
-        if(!DistantConfig.RECEIVE.get()||!VoxyBridge.enabled()){if(session!=null){session.radius=0;send(session,List.of());close();}return;}
+        if(!DistantConfig.RECEIVE.get()||!VoxyBridge.enabled()){if(session!=null){var old=session;Protocol.CHANNEL.sendToServer(new Protocol.Requests(old.epoch,0,old.view,DistantConfig.DOWNLOAD_KBPS.get(),old.networkCapacity,List.of()));close();}return;}
         if(session==null){
             try{DistantConfig.validateReceiveMemory(mc.level.getSectionsCount(),DistantConfig.RECEIVE_MIB.get());}
             catch(IllegalArgumentException ex){failure=ex.getMessage();if(mc.player.tickCount%100==0)mc.gui.setOverlayMessage(net.minecraft.network.chat.Component.literal(failure),false);return;}
-            WorldEngine engine=VoxyBridge.acquire(mc.level);if(engine==null)return;session=new Session(engine,mc.level,greeting);session.versions.putAll(initialVersions);session.fullRetry.addAll(initialVersions.keySet());session.fullRetry.addAll(lightReady);initialVersions.clear();
+            WorldEngine engine=VoxyBridge.acquire(mc.level);if(engine==null)return;session=new Session(engine,mc.level,greeting);session.versions.putAll(initialVersions);session.fullRetry.addAll(initialVersions.keySet());session.fullRetry.addAll(lightReady);session.loadedFull.addAll(lightReady);initialVersions.clear();
+            Session created=session;created.offer(()->{try{VoxyBridge.coverage(engine).remote(created.hello.minY(),created.hello.maxY(),created.indexMiB);}catch(RuntimeException e){failed(created,e);}});
         }
-        Session s=session;s.ticks++;
-        if(!s.budgetInsufficient.isEmpty()&&s.ticks%100==0)mc.gui.setOverlayMessage(net.minecraft.network.chat.Component.literal("远景列超出接收信用；请增大接收缓冲后重连，或提高服务端单人发送内存"),false);
-        drainMainWork(s);
+        Session s=session;
+        if(!s.budgetInsufficient.isEmpty()&&mc.player.tickCount%100==0)mc.gui.setOverlayMessage(net.minecraft.network.chat.Component.literal("远景列超出接收信用；请增大接收缓冲后重连，或提高服务端单人发送内存"),false);
+        if(s.radius<s.requestedRadius&&mc.player.tickCount%100==0)mc.gui.setOverlayMessage(net.minecraft.network.chat.Component.literal("索引预算不足：实际远景 "+s.radius+" / "+s.requestedRadius+" 区块；详情见 VD 设置"),false);
+        capture(s);
+        int receiveRadius=DistantConfig.RECEIVE_RADIUS.get(),renderRadius=VoxyBridge.radiusChunks();
+        s.frame.set(new Frame(mc.player.chunkPosition().x,mc.player.chunkPosition().z,mc.options.renderDistance().get(),Math.min(s.hello.radius(),receiveRadius>0?receiveRadius:renderRadius),renderRadius,mc.isPaused()||mc.screen!=null&&mc.screen.isPauseScreen()));
+        if(s.tickQueued.compareAndSet(false,true)&&!s.offer(()->{
+            var input=s.frame.getAndSet(null);s.tickQueued.set(false);if(s.closed||input==null)return;
+            try{tick(s,input);}catch(RuntimeException e){failed(s,e);}
+        }))s.tickQueued.set(false);
+    }
+    private static void tick(Session s,Frame input){
+        s.input=input;s.ticks++;
+        for(long p:s.vanillaDirty)if(s.vanillaDirty.remove(p))dirty(s,new Protocol.Dirty(s.hello.dimension(),ChunkPos.getX(p),ChunkPos.getZ(p),s.versions.getOrDefault(p,0L),true),p,0);
+        for(long p:s.unloaded)if(s.unloaded.remove(p)){s.checked.remove(p);s.retries.remove(p);if(inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)))s.invalid.add(p);}
         long rateNow=System.nanoTime();
         if(s.rateAt==0){s.rateAt=rateNow;s.rateBytes=s.received;s.rateColumns=s.applied;}
         else if(rateNow-s.rateAt>=TimeUnit.SECONDS.toNanos(1)){
@@ -163,56 +193,48 @@ public final class RemoteClient {
             s.receiveKiBPerSecond=(s.received-s.rateBytes)/1024.0/seconds;
             s.receiveColumnsPerSecond=(s.applied-s.rateColumns)/seconds;
             s.rateAt=rateNow;s.rateBytes=s.received;s.rateColumns=s.applied;
+            s.receiveSpeed=String.format(Locale.ROOT,"接收速度 %.1f KiB/s · %.1f 列/秒 · 目录 %d 区域 · 核验中 %d · 待确认 %d",s.receiveKiBPerSecond,s.receiveColumnsPerSecond,s.discovery.regions.size(),s.regionQueries.size(),s.pending.size());
+            var usage=VoxyBridge.coverage(s.engine).usage();s.indexStatus=String.format(Locale.ROOT,"覆盖索引 %d/%d 页 · %.0f%% · %.1f/%d MiB",usage.pages(),usage.limit(),100.0*usage.pages()/usage.limit(),usage.pages()*400000.0/1048576,DistantConfig.INDEX_MIB.get());
         }
         if(DebugLog.enabled())s.requestStates.merge(s.requestState,1,Integer::sum);
         if(DebugLog.enabled()&&System.nanoTime()-s.debugAt>=TimeUnit.SECONDS.toNanos(DistantConfig.DEBUG_INTERVAL.get())){
             long now=System.nanoTime();
             if(s.debugAt!=0)DebugLog.log("CLIENT interval world={} dimension={} epoch={} interval_ms={} payload_bytes={} payload_mbps={} applied_columns={} client_ticks={} request_state_ticks={}",s.hello.world(),s.hello.dimension(),s.epoch,DebugLog.millis(now-s.debugAt),s.received-s.debugReceived,DebugLog.mbps(s.received-s.debugReceived,now-s.debugAt),s.applied-s.debugApplied,s.ticks-s.debugTicks,s.requestStates);
             s.debugAt=now;s.debugReceived=s.received;s.debugApplied=s.applied;s.debugTicks=s.ticks;s.requestStates.clear();
-            DebugLog.log("CLIENT state epoch={} center={},{} radius={} bands={} applied={} received_payload_bytes={} reserved_bytes={} receive_limit={} snapshot_bytes={} snapshot_limit={} advertised_credit={} pending={}/{} invalid={} full_retry={} worker_queue={} worker_active={} main_tasks={} discovering={} request_state={}",s.epoch,s.x,s.z,s.radius,s.hello.bands(),s.applied,s.received,s.memory.get(),s.receiveLimit,s.snapshotMemory.get(),s.snapshotLimit,s.networkCapacity,s.pending.size(),DistantConfig.REQUEST_WINDOW.get(),s.invalid.size(),s.fullRetry.size(),s.worker.getQueue().size(),s.worker.getActiveCount(),mc.getPendingTasksCount(),s.discovery.busy(),s.requestState);
+            DebugLog.log("CLIENT state epoch={} center={},{} radius={} bands={} applied={} received_payload_bytes={} reserved_bytes={} receive_limit={} snapshot_bytes={} snapshot_limit={} advertised_credit={} pending={}/{} invalid={} full_retry={} worker_queue={} worker_active={} discovering={} request_state={}",s.epoch,s.x,s.z,s.radius,s.hello.bands(),s.applied,s.received,s.memory.get(),s.receiveLimit,s.snapshotMemory.get(),s.snapshotLimit,s.networkCapacity,s.pending.size(),DistantConfig.REQUEST_WINDOW.get(),s.invalid.size(),s.fullRetry.size(),s.worker.getQueue().size(),s.worker.getActiveCount(),s.discovery.busy(),s.requestState);
             var directories=coverageUsage(s);DebugLog.log("CLIENT directory prepared={} boundary_checks={} column_checks={} reads={} migrations={} queries={}",s.discovery.prepared,s.discovery.boundaryChecks,s.discovery.checks,directories.reads(),directories.migrations(),s.regionQueries.size());
             DebugLog.timings("CLIENT");
             long oldest=0;for(var requested:s.pending.values())oldest=Math.max(oldest,now-requested.started());
             synchronized(s.assemblies){DebugLog.log("CLIENT pipeline world={} dimension={} epoch={} partial_columns={} partial_batches={} oldest_request_ms={} ingest_jobs={} download_kib={} duty={} retry_cooldown={}",s.hello.world(),s.hello.dimension(),s.epoch,s.assemblies.size(),s.batchAssemblies.size(),DebugLog.millis(oldest),s.engine.instanceIn.getIngestService().getTaskCount(),DistantConfig.DOWNLOAD_KBPS.get(),DistantConfig.RECEIVE_DUTY.get(),s.retries.size());}
             for(var retry:s.retries.oldest(4))DebugLog.log("CLIENT retry_wait epoch={} x={} z={} desired={} attempts={} urgent={} remaining_ms={}",s.epoch,ChunkPos.getX(retry.position()),ChunkPos.getZ(retry.position()),retry.desired(),retry.attempts(),retry.urgent(),DebugLog.millis(Math.max(0,retry.due()-now)));
-            DebugLog.connection("CLIENT",mc.getConnection().getConnection(),mc.player.getUUID());
         }
-        if(s.ticks%20==0){s.checkpointPending=true;drainMainWork(s);}
+        s.scanning=s.discovery.busy();s.invalidCount=s.invalid.size();s.retryCount=s.retries.size();
+        if(s.ticks%20==0){long timing=DebugLog.start();VoxyBridge.coverage(s.engine).checkpointIfDue(s.engine.storage::flush);DebugLog.end(CLIENT_CHECKPOINT,timing);}
         if(maintenancePaused)return;
-        if(!s.deferredSnapshots.isEmpty()&&s.worker.getQueue().size()<256){for(long p:s.deferredSnapshots)if(s.deferredSnapshots.remove(p))s.fullRetry.add(p);}
-        if(s.deferredDirty.isEmpty()&&!s.fullRetry.isEmpty()){
-            var it=s.fullRetry.iterator();
-            for(int budget=8;it.hasNext()&&budget>0&&s.worker.getQueue().size()<256;){
-                long p=it.next();var chunk=mc.level.getChunkSource().getChunk(ChunkPos.getX(p),ChunkPos.getZ(p),ChunkStatus.FULL,false);
-                if(chunk!=null&&!lightReady.contains(p))continue;
-                if(chunk!=null&&s.snapshotMemory.get()+chunk.getSectionsCount()*ChunkSnapshot.RESERVED_BYTES>s.snapshotLimit)break;
-                it.remove();if(chunk!=null)full(s.engine,chunk);else s.invalid.add(p);
-                budget--;
-            }
+        for(long p:s.fullRetry){
+            if(s.closed)return;
+            if(s.fullRetry.remove(p)){if(s.loadedFull.contains(p))s.captureRequested.add(p);else s.invalid.add(p);}
         }
-        if(!s.deferredDirty.isEmpty())return;
-        int x=mc.player.chunkPosition().x,z=mc.player.chunkPosition().z,view=mc.options.renderDistance().get();
-        int receiveRadius=DistantConfig.RECEIVE_RADIUS.get();
-        int requested=Math.min(s.hello.radius(),receiveRadius>0?receiveRadius:VoxyBridge.radiusChunks());
+        int x=input.x(),z=input.z(),view=input.view(),requested=input.requested();
         int indexMiB=DistantConfig.INDEX_MIB.get();
         boolean indexChanged=s.indexMiB!=indexMiB;
         if(indexChanged){VoxyBridge.coverage(s.engine).remote(s.hello.minY(),s.hello.maxY(),indexMiB);s.indexMiB=indexMiB;}
         var coverage=VoxyBridge.coverage(s.engine);
         var motion=dev.voxydistant.movement.MovementPrediction.CLIENT.snapshot();
+        if(motion.world()!=s.level)return;
         boolean pressure=coverage.pressure();
         if(pressure)s.lastPressureTick=s.ticks;
         int radius=pressure?coverage.stepDown(requested,x,z)
                 :s.x!=x||s.z!=z||s.requestedRadius!=requested||indexChanged||s.radius<requested&&s.ticks-s.lastPressureTick>=200&&s.ticks%20==0
                 ?coverage.limitRadius(requested,x,z):s.radius;
         s.requestedRadius=requested;
-        if(radius<requested&&s.ticks%100==0)mc.gui.setOverlayMessage(net.minecraft.network.chat.Component.literal("索引预算不足：实际远景 "+radius+" / "+requested+" 区块；详情见 VD 设置"),false);
-        if(s.movementRevision!=motion.revision()||radius!=s.radius||indexChanged)radius=Math.min(radius,coverage.limitShape(motion.shape(radius,s.hello.radius()),Math.min(radius,VoxyBridge.radiusChunks())));
+        if((motion.amount()!=0||motion.centerX()!=motion.x()||motion.centerZ()!=motion.z())&&(s.movementRevision!=motion.revision()||radius!=s.radius||indexChanged))radius=Math.min(radius,coverage.limitShape(motion.shape(radius,s.hello.radius()),Math.min(radius,input.renderRadius())));
         boolean teleportMove=s.x!=Integer.MIN_VALUE&&(Math.abs((long)x-s.x)>32||Math.abs((long)z-s.z)>32);
         if(s.shape==null||teleportMove||s.radius!=radius||s.view!=view||s.movementRevision!=motion.revision()) {
             if(DebugLog.enabled())DebugLog.log("CLIENT move epoch={} from_x={} from_z={} x={} z={} generation={} radius={} view={}",s.epoch,s.x,s.z,x,z,s.generation+1,radius,view);
             boolean teleport=s.x!=Integer.MIN_VALUE&&(Math.abs((long)x-s.x)>32||Math.abs((long)z-s.z)>32);
             s.x=x;s.z=z;s.radius=radius;s.view=view;s.generation++;s.preempted=0;
-            if(teleport){s.epoch=++sequence;s.pending.clear();s.checked.clear();s.invalid.clear();s.retries.clear();synchronized(s.assemblies){for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();s.discardedBatches.clear();}}
+            if(teleport){s.epoch=sequence.incrementAndGet();s.pending.clear();s.checked.clear();s.invalid.clear();s.retries.clear();synchronized(s.assemblies){for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();s.discardedBatches.clear();}}
             if(teleport){s.discovery.reset();s.regionQueries.clear();}
             s.movementRevision=motion.revision();s.shape=motion.shape(radius,s.hello.radius()).precision(requested==0?1:(double)radius/requested);s.discovery.move(s.shape);
             var regionCancels=new ArrayList<Long>();for(var it=s.regionQueries.entrySet().iterator();it.hasNext();){var entry=it.next();var r=entry.getValue().region();if(s.discovery.regions.get(RegionDiscovery.key(r.x,r.z))!=r){regionCancels.add(entry.getKey());it.remove();}}
@@ -224,9 +246,8 @@ public final class RemoteClient {
             s.versions.keySet().removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p))&&!s.pending.containsKey(p));
             s.invalid.removeIf(p->!inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)));
             s.retries.moved(p->inRange(s,ChunkPos.getX(p),ChunkPos.getZ(p)),p->desired(s,p),p->urgent(s,p),System.nanoTime());
-            Minecraft.getInstance().execute(()->send(s,List.of()));
-            s.activeX=x;s.activeZ=z;s.activeRadius=radius;s.activePending=true;
-            drainMainWork(s);
+            send(s,List.of());
+            coverage.active(x,z,radius);
         }
         var expired=expireRequests(s,System.nanoTime());
         for(int i=0;i<expired.size();i+=16)send(s,List.of(),expired.subList(i,Math.min(i+16,expired.size())));
@@ -252,14 +273,12 @@ public final class RemoteClient {
     }
     public static String receiveSpeed() {
         Session s=session;
-        return s==null?"接收速度：无会话":String.format(Locale.ROOT,"接收速度 %.1f KiB/s · %.1f 列/秒 · 目录 %d 区域 · 核验中 %d · 待确认 %d",s.receiveKiBPerSecond,s.receiveColumnsPerSecond,s.discovery.regions.size(),s.regionQueries.size(),s.pending.size());
+        return s==null?"接收速度：无会话":s.receiveSpeed;
     }
     public static String indexStatus(){
         Session s=session;
         if(s==null)return "覆盖索引：无远景会话";
-        var usage=VoxyBridge.coverage(s.engine).usage();
-        return String.format(Locale.ROOT,"覆盖索引 %d/%d 页 · %.0f%% · %.1f/%d MiB",
-                usage.pages(),usage.limit(),100.0*usage.pages()/usage.limit(),usage.pages()*400000.0/1048576,DistantConfig.INDEX_MIB.get());
+        return s.indexStatus;
     }
     public static String radiusStatus(){
         Session s=session;
@@ -300,28 +319,32 @@ public final class RemoteClient {
         long now=System.nanoTime();
         for(var it=s.regionQueries.entrySet().iterator();it.hasNext();){var q=it.next();if(now-q.getValue().sent()>TimeUnit.SECONDS.toNanos(30)){var region=q.getValue().region();region.queried=false;region.query=true;it.remove();}}
         while(s.regionQueries.size()<DistantConfig.REGION_QUERY_WINDOW.get()){var region=s.discovery.nextQuery();if(region==null)break;long id=++s.regionSequence;s.regionQueries.put(id,new RegionRequest(region,now));Protocol.CHANNEL.sendToServer(new Protocol.RegionQuery(s.epoch,id,region.x,region.z));}
-        if(s.preparingDirectory||s.directoryTick==s.ticks||s.worker.getQueue().size()>=256)return;
+        if(s.directoryTick==s.ticks||s.worker.getQueue().size()>=256)return;
         var tasks=new ArrayList<RegionDiscovery.Region>();
         for(var r:s.discovery.regions.values())if(r.maskPending||r.prepare&&!r.migrate)tasks.add(r);
         if(tasks.isEmpty())for(var r:s.discovery.regions.values())if(r.prepare)tasks.add(r);
         if(tasks.isEmpty())return;
-        tasks.sort(Comparator.comparingLong((RegionDiscovery.Region r)->r.preparedAt).thenComparingDouble(r->s.shape.minimumScore(r.x*32,r.z*32,r.x*32+31,r.z*32+31)));
+        tasks.sort(Comparator.comparingLong((RegionDiscovery.Region r)->r.preparedAt).thenComparingDouble(r->r.minimum));
         if(tasks.size()>8)tasks.subList(8,tasks.size()).clear();
-        s.preparingDirectory=true;s.directoryTick=s.ticks;int epoch=s.epoch;var footprint=s.shape;
-        if(!s.offer(()->{
-            try{
-                long started=DebugLog.start(),deadline=System.nanoTime()+2_000_000L;var results=new LinkedHashMap<RegionDiscovery.Region,CoverageStore.Directory>();var masks=new LinkedHashMap<RegionDiscovery.Region,RegionDiscovery.Masks>();
-                for(var region:tasks){if(s.closed||s.epoch!=epoch)break;if(region.maskPending)masks.put(region,s.discovery.buildMasks(region,footprint));if(region.prepare)results.put(region,VoxyBridge.coverage(s.engine).directory(region.x,region.z,region.migrate));if(System.nanoTime()>=deadline)break;}
-                DebugLog.end(CLIENT_INDEX,started);
-                Minecraft.getInstance().execute(()->{s.preparingDirectory=false;if(session!=s||s.epoch!=epoch)return;masks.forEach((region,value)->s.discovery.applyMasks(region,footprint,value));results.forEach((region,directory)->{
-                    if(directory!=null)for(int i=0;i<1024;i++){long p=ChunkPos.asLong(region.x*32+(i&31),region.z*32+(i>>5));if(s.versions.getOrDefault(p,0L)>directory.versions[i])directory.levels[i]=5;}
-                    s.discovery.local(region,directory);
-                });});
-            }catch(RuntimeException e){failed(s,e);}
-        }))s.preparingDirectory=false;
+        s.directoryTick=s.ticks;var footprint=s.shape;
+        long started=DebugLog.start(),deadline=System.nanoTime()+2_000_000L;
+        for(var region:tasks){
+            if(s.closed)break;
+            if(region.maskPending)s.discovery.applyMasks(region,footprint,s.discovery.buildMasks(region,footprint));
+            if(region.prepare){
+                var directory=VoxyBridge.coverage(s.engine).directory(region.x,region.z,region.migrate);
+                if(directory!=null)for(int i=0;i<1024;i++){long p=ChunkPos.asLong(region.x*32+(i&31),region.z*32+(i>>5));if(s.versions.getOrDefault(p,0L)>directory.versions[i])directory.levels[i]=5;}
+                s.discovery.local(region,directory);
+            }
+            if(System.nanoTime()>=deadline)break;
+        }
+        DebugLog.end(CLIENT_INDEX,started);
     }
     public static void regionSummary(Protocol.RegionSummary summary){
-        Session s=session;if(s==null||s.closed||s.epoch!=summary.epoch())return;
+        Session s=session;if(s!=null)s.receive(()->{try{regionSummary(s,summary);}catch(RuntimeException e){failed(s,e);}});
+    }
+    private static void regionSummary(Session s,Protocol.RegionSummary summary){
+        if(s.closed||s.epoch!=summary.epoch())return;
         var query=s.regionQueries.remove(summary.id());if(query==null)return;var region=query.region();
         if(s.discovery.regions.get(RegionDiscovery.key(region.x,region.z))!=region)return;
         if(region.x!=summary.x()||region.z!=summary.z())throw new IllegalArgumentException("Mismatched region summary");
@@ -332,9 +355,8 @@ public final class RemoteClient {
     }
     private static void requestMore(Session s) {
         if(session!=s||s.closed||maintenancePaused||s.radius==0||VoxyBridge.coverage(s.engine).overBudget())return;
-        var mc=Minecraft.getInstance();
         int window=DistantConfig.REQUEST_WINDOW.get();
-        s.requestState=mc.isPaused()?"paused":!s.deferredDirty.isEmpty()||!s.deferredReplies.isEmpty()||s.worker.getQueue().remainingCapacity()==0?"worker_queue":s.pending.size()>=window&&(!s.discovery.busy()||s.preempted>=16)?"request_window":s.requestBudget==0?"request_rate":s.memory.get()>DistantConfig.RECEIVE_MIB.get()*1048576L*3/4?"receive_memory":VoxyBridge.backedUp(s.engine)?"voxy_backlog":"scanning";
+        s.requestState=s.input!=null&&s.input.paused()?"paused":s.worker.getQueue().remainingCapacity()==0?"worker_queue":s.pending.size()>=window&&(!s.discovery.busy()||s.preempted>=16)?"request_window":s.requestBudget==0?"request_rate":s.memory.get()>s.receiveLimit*3/4?"receive_memory":VoxyBridge.backedUp(s.engine)?"voxy_backlog":"scanning";
         if(!s.requestState.equals("scanning")){switch(s.requestState){case "request_window"->DebugLog.count(CLIENT_REQUEST_WINDOW);case "receive_memory"->DebugLog.count(CLIENT_REQUEST_MEMORY);case "voxy_backlog"->DebugLog.count(CLIENT_REQUEST_BACKLOG);}return;}
         var positions=new LinkedHashSet<Long>();
         int batch=Math.min(64,Math.min(s.requestBudget,Math.max(0,window-s.pending.size())+(!s.discovery.busy()?0:Math.max(0,16-s.preempted))));
@@ -355,38 +377,27 @@ public final class RemoteClient {
             Long p=s.discovery.poll();if(p==null)break;
             if(s.pending.containsKey(p)||s.retries.scheduled(p)||s.checked.getOrDefault(p,5)<=desired(s,p))continue;
             Integer blocked=s.budgetInsufficient.get(p);if(blocked!=null&&desired(s,p)<=blocked)continue;
-            if(mc.level.getChunkSource().getChunk(ChunkPos.getX(p),ChunkPos.getZ(p),ChunkStatus.FULL,false)!=null){s.loadedFull.add(p);continue;}
+            if(s.loadedFull.contains(p))continue;
             if(s.pending.size()+positions.size()>=window){var cancel=preempt(s,p,positions);if(cancel==null){s.invalid.add(p);break;}cancels.add(cancel);}
             positions.add(p);
         }
-        positions.removeIf(p->{if(mc.level.getChunkSource().getChunk(ChunkPos.getX(p),ChunkPos.getZ(p),ChunkStatus.FULL,false)==null)return false;s.loadedFull.add(p);s.fullRetry.add(p);s.retries.remove(p);return true;});
+        positions.removeIf(p->{if(!s.loadedFull.contains(p))return false;s.fullRetry.add(p);s.retries.remove(p);return true;});
         if(positions.isEmpty()){if(!cancels.isEmpty())send(s,List.of(),cancels);s.requestState=!s.discovery.busy()?"directory_complete":"directory_pending";return;}
         s.requestBudget-=positions.size();
         DebugLog.end(CLIENT_REQUEST_IDLE,s.requestIdleAt);s.requestIdleAt=0;
         s.requestState="index_lookup";
         DebugLog.count(CLIENT_REQUEST_BATCH);
         long now=System.nanoTime();var issued=new LinkedHashMap<Long,Long>();positions.forEach(p->{long id=++s.requestSequence;s.pending.put(p,new Pending(now,desired(s,p),s.generation,id));issued.put(p,id);});int epoch=s.epoch;
-        if(!s.offer(()->{
-            long timing=DebugLog.start();try {
-                var wants=new ArrayList<Protocol.Want>();var index=VoxyBridge.coverage(s.engine);
-                for(long p:positions){int cx=ChunkPos.getX(p),cz=ChunkPos.getZ(p);var stamp=index.directoryColumn(cx,cz);var pending=s.pending.get(p);if(pending!=null)wants.add(new Protocol.Want(cx,cz,stamp.version(),stamp.level(),issued.get(p),pending.desired()));}
-                long ready=DebugLog.start();Minecraft.getInstance().execute(()->{DebugLog.end(CLIENT_REQUEST_CONTROL,ready);if(session==s&&s.epoch==epoch){
-                    wants.removeIf(w->!currentRequest(s,ChunkPos.asLong(w.x(),w.z()),w.requestId())||!inRange(s,w.x(),w.z()));
-                    for(var w:wants){long p=ChunkPos.asLong(w.x(),w.z());var request=s.pending.get(p);request.before=new CoverageStore.Stamp(w.version(),w.level());request.dirtyBefore=s.versions.getOrDefault(p,0L);request.lastProgress=System.nanoTime();request.sent=true;if(w.level()<5&&w.version()>=request.dirtyBefore)s.checked.put(p,w.level());}
-                    if(DebugLog.verbose())for(var w:wants)DebugLog.log("CLIENT want epoch={} generation={} x={} z={} request_id={} version={} level={} desired={}",s.epoch,s.generation,w.x(),w.z(),w.requestId(),w.version(),w.level(),desired(s,ChunkPos.asLong(w.x(),w.z())));
-                    send(s,wants,cancels);refill(s);
-                }});
-            }catch(RuntimeException e){failed(s,e);}finally{DebugLog.end(CLIENT_INDEX,timing);}
-        })){
-            for(long p:positions){s.pending.remove(p);s.invalid.add(p);}
-            if(!cancels.isEmpty())send(s,List.of(),cancels);
-            s.requestState="worker_queue";
-        }
+        long timing=DebugLog.start();var wants=new ArrayList<Protocol.Want>();var index=VoxyBridge.coverage(s.engine);
+        for(long p:positions){int cx=ChunkPos.getX(p),cz=ChunkPos.getZ(p);var stamp=index.directoryColumn(cx,cz);var pending=s.pending.get(p);wants.add(new Protocol.Want(cx,cz,stamp.version(),stamp.level(),issued.get(p),pending.desired()));}
+        for(var w:wants){long p=ChunkPos.asLong(w.x(),w.z());var request=s.pending.get(p);request.before=new CoverageStore.Stamp(w.version(),w.level());request.dirtyBefore=s.versions.getOrDefault(p,0L);request.lastProgress=System.nanoTime();request.sent=true;if(w.level()<5&&w.version()>=request.dirtyBefore)s.checked.put(p,w.level());}
+        if(DebugLog.verbose())for(var w:wants)DebugLog.log("CLIENT want epoch={} generation={} x={} z={} request_id={} version={} level={} desired={}",s.epoch,s.generation,w.x(),w.z(),w.requestId(),w.version(),w.level(),desired(s,ChunkPos.asLong(w.x(),w.z())));
+        if(s.epoch==epoch)send(s,wants,cancels);DebugLog.end(CLIENT_INDEX,timing);
     }
     private static void refill(Session s){
         if(s.refillQueued)return;
         s.refillQueued=true;
-        Minecraft.getInstance().tell(()->{s.refillQueued=false;requestMore(s);});
+        if(!s.offer(()->{s.refillQueued=false;try{requestMore(s);}catch(RuntimeException e){failed(s,e);}}))s.refillQueued=false;
     }
     private static Protocol.Cancel preempt(Session s,long candidate,Set<Long> positions){
         if(s.preempted>=16)return null;
@@ -403,8 +414,8 @@ public final class RemoteClient {
         retry(s,victim,"preempted");s.preempted++;
         return new Protocol.Cancel(ChunkPos.getX(victim),ChunkPos.getZ(victim),removed.id());
     }
-    private static boolean inRange(Session s,int x,int z){var player=Minecraft.getInstance().player.chunkPosition();long dx=(long)x-player.x,dz=(long)z-player.z;return s.shape!=null&&s.shape.contains(x,z)&&dx*dx+dz*dz<=(long)s.hello.radius()*s.hello.radius();}
-    private static int desired(Session s,long p){var player=Minecraft.getInstance().player.chunkPosition();int x=ChunkPos.getX(p),z=ChunkPos.getZ(p),allowed=s.bands.select(x,z,player.x,player.z);return s.shape==null?allowed:Math.max(s.shape.desired(s.bands,x,z),allowed);}
+    private static boolean inRange(Session s,int x,int z){int px=s.input==null?s.x:s.input.x(),pz=s.input==null?s.z:s.input.z();long dx=(long)x-px,dz=(long)z-pz;return s.shape!=null&&s.shape.contains(x,z)&&dx*dx+dz*dz<=(long)s.hello.radius()*s.hello.radius();}
+    private static int desired(Session s,long p){int px=s.input==null?s.x:s.input.x(),pz=s.input==null?s.z:s.input.z(),x=ChunkPos.getX(p),z=ChunkPos.getZ(p),allowed=s.bands.select(x,z,px,pz);return s.shape==null?allowed:Math.max(s.shape.desired(s.bands,x,z),allowed);}
     private static boolean urgent(Session s,long p){
         int target=desired(s,p),known=s.checked.getOrDefault(p,5);return target==s.bands.levels()[0]||known<5&&known>target;
     }
@@ -416,7 +427,6 @@ public final class RemoteClient {
     /** Called on the apply lane so the stamp reflects accepted voxels, not just packet metadata. */
     private static void completed(Session s,int epoch,long p,long requestId,long responseVersion,String source){
         var stamp=VoxyBridge.coverage(s.engine).column(ChunkPos.getX(p),ChunkPos.getZ(p),s.hello.minY(),s.hello.maxY());
-        Minecraft.getInstance().execute(()->{
             if(session!=s||s.epoch!=epoch||!currentRequest(s,p,requestId))return;
             var requested=s.pending.remove(p);
             int target=desired(s,p);
@@ -432,7 +442,6 @@ public final class RemoteClient {
             else{s.invalid.remove(p);s.retries.remove(p);}
             if(DebugLog.verbose())DebugLog.log("CLIENT complete epoch={} generation={} request_generation={} request_desired={} x={} z={} request_id={} source={} version={} latest={} level={} desired={} refine={} reason={}",epoch,s.generation,requested.generation(),requested.desired(),ChunkPos.getX(p),ChunkPos.getZ(p),requestId,source,stamp.version(),latest,stamp.level(),target,refine,!current?"newer_version":stamp.level()>target?wake?"precision":"no_progress":"satisfied");
             refill(s);
-        });
     }
     private static boolean currentRequest(Session s,long p,long requestId){var pending=s.pending.get(p);return pending!=null&&pending.id()==requestId;}
     private static List<Protocol.Cancel> expireRequests(Session s,long now){
@@ -462,14 +471,18 @@ public final class RemoteClient {
     private static void send(Session s,List<Protocol.Want> wants){send(s,wants,List.of());}
     private static void send(Session s,List<Protocol.Want> wants,List<Protocol.Cancel> cancels){if(session==s&&!s.closed&&!maintenancePaused){
         if(DebugLog.verbose())DebugLog.log("CLIENT request world={} dimension={} epoch={} wants={} cancels={} pending={} credit={} bandwidth_kib={}",s.hello.world(),s.hello.dimension(),s.epoch,wants.size(),cancels.size(),s.pending.size(),s.networkCapacity,DistantConfig.DOWNLOAD_KBPS.get());
-        var player=Minecraft.getInstance().player.chunkPosition();
-        int envelope=s.shape==null||s.radius==0?s.radius:Math.min(s.hello.radius(),(int)Math.ceil(Math.hypot(s.shape.centerX()-player.x,s.shape.centerZ()-player.z)+s.radius*(1+.5*s.shape.amount())));
-        if(s.radius>0)for(var entry:s.pending.entrySet())if(entry.getValue().receiving){long p=entry.getKey();envelope=Math.min(s.hello.radius(),Math.max(envelope,(int)Math.ceil(Math.sqrt((double)(ChunkPos.getX(p)-player.x)*(ChunkPos.getX(p)-player.x)+(double)(ChunkPos.getZ(p)-player.z)*(ChunkPos.getZ(p)-player.z)))));}
+        int px=s.input==null?s.x:s.input.x(),pz=s.input==null?s.z:s.input.z();
+        int envelope=s.shape==null||s.radius==0?s.radius:Math.min(s.hello.radius(),(int)Math.ceil(Math.hypot(s.shape.centerX()-px,s.shape.centerZ()-pz)+s.radius*(1+.5*s.shape.amount())));
+        if(s.radius>0)for(var entry:s.pending.entrySet())if(entry.getValue().receiving){long p=entry.getKey();envelope=Math.min(s.hello.radius(),Math.max(envelope,(int)Math.ceil(Math.sqrt((double)(ChunkPos.getX(p)-px)*(ChunkPos.getX(p)-px)+(double)(ChunkPos.getZ(p)-pz)*(ChunkPos.getZ(p)-pz)))));}
         Protocol.CHANNEL.sendToServer(new Protocol.Requests(s.epoch,envelope,s.view,DistantConfig.DOWNLOAD_KBPS.get(),s.networkCapacity,wants,cancels,s.shape));
     }}
     private static long reserve(Session s,Protocol.Fragment f){return Protocol.reservation(f.totalLength(),f.rawLength(),f.level(),s.hello.maxY()-s.hello.minY());}
     public static void fragment(Protocol.Fragment f) {
         Session s=session;if(s==null||s.closed||f.epoch()!=s.epoch){if(DebugLog.verbose())DebugLog.log("CLIENT discard epoch={} transfer={} reason=inactive_epoch",f.epoch(),f.transfer());return;}
+        s.receive(()->fragment(s,f));
+    }
+    private static void fragment(Session s,Protocol.Fragment f){
+        if(s.closed||f.epoch()!=s.epoch)return;
         try {
             ColumnCodec.bounded(f.level(),0,4);ColumnCodec.bounded(f.totalLength(),1,ColumnCodec.MAX_BYTES);ColumnCodec.bounded(f.rawLength(),1,ColumnCodec.MAX_BYTES);
             ColumnCodec.bounded(f.offset(),0,f.totalLength());if(f.bytes().length==0||f.bytes().length>f.totalLength()-f.offset())throw new IllegalArgumentException("Invalid fragment range");
@@ -483,9 +496,7 @@ public final class RemoteClient {
                 a.trace.fragment(f.offset(),f.bytes().length,f.totalLength(),f.rawLength(),1);
                 if(a.offset!=a.bytes.length)return;s.assemblies.remove(f.transfer());complete=a;
             }
-            long queued=DebugLog.start();
-            s.worker.execute(()->{
-                DebugLog.end(CLIENT_QUEUE,queued);
+            {
                 long started=System.nanoTime();String result="discarded";try {
                     if(s.closed||s.epoch!=f.epoch())return;
                     long decode=DebugLog.start();var column=ColumnCodec.decode(new ColumnCodec.Encoded(f.compressed(),f.rawLength(),complete.bytes));complete.trace.decode+=DebugLog.end(CLIENT_DECODE,decode);
@@ -496,22 +507,25 @@ public final class RemoteClient {
                     long lock=DebugLog.start();
                     synchronized(coverage){
                         DebugLog.end(CLIENT_COVERAGE_LOCK,lock);
-                        if(session==s&&s.epoch==f.epoch()&&currentRequest(s,position,f.requestId())&&!s.loadedFull.contains(position)&&column.version()>=latest){long apply=DebugLog.start();int conflicts=coverage.conflicts(column.x(),column.z(),s.hello.minY(),s.hello.maxY(),column.version());if(conflicts>0){DebugLog.count(CLIENT_OLD_VERSION_REPLACED);if(DebugLog.verbose())DebugLog.log("CLIENT authoritative_replace x={} z={} reply_version={} newer_sections={}",column.x(),column.z(),column.version(),conflicts);}CoarseLodReceiver.receive(s.engine,column,s.level.registryAccess(),true);complete.trace.apply+=DebugLog.end(CLIENT_APPLY,apply);s.applied++;complete.trace.applied++;}
+                        if(session==s&&s.epoch==f.epoch()&&currentRequest(s,position,f.requestId())&&!s.loadedFull.contains(position)&&column.version()>=latest){long apply=DebugLog.start();int conflicts=coverage.conflicts(column.x(),column.z(),s.hello.minY(),s.hello.maxY(),column.version());if(conflicts>0){DebugLog.count(CLIENT_OLD_VERSION_REPLACED);if(DebugLog.verbose())DebugLog.log("CLIENT authoritative_replace x={} z={} reply_version={} newer_sections={}",column.x(),column.z(),column.version(),conflicts);}CoarseLodReceiver.receive(s.engine,column,s.registries,true);complete.trace.apply+=DebugLog.end(CLIENT_APPLY,apply);s.applied++;complete.trace.applied++;}
                     }
                     result="ok";
                     if(DebugLog.verbose())DebugLog.log("CLIENT column epoch={} transfer={} x={} z={} request_id={} level={} version={} latest={} payload_bytes={} raw_bytes={} reservation={} applied={}",s.epoch,f.transfer(),f.x(),f.z(),f.requestId(),f.level(),f.version(),latest,complete.bytes.length,f.rawLength(),complete.reservation,currentRequest(s,ChunkPos.asLong(f.x(),f.z()),f.requestId())&&column.version()>=latest);
                     completed(s,f.epoch(),ChunkPos.asLong(f.x(),f.z()),f.requestId(),f.version(),"column");
                 }catch(RuntimeException e){result="failed";if(DebugLog.enabled())DebugLog.log("CLIENT failed epoch={} transfer={} error={}",f.epoch(),f.transfer(),e.toString());failed(s,e);}
-                finally{long paced=System.nanoTime();pace(started);complete.trace.applied(started,paced,result);s.memory.addAndGet(-complete.reservation);long receiptQueued=DebugLog.start();Minecraft.getInstance().execute(()->{DebugLog.end(CLIENT_RECEIPT_CONTROL,receiptQueued);if(session==s&&s.epoch==f.epoch()){complete.trace.receipt();Protocol.CHANNEL.sendToServer(new Protocol.Receipt(f.epoch(),f.transfer()));}});}
-            });
+                finally{long paced=System.nanoTime();pace(started);complete.trace.applied(started,paced,result);s.memory.addAndGet(-complete.reservation);if(session==s&&s.epoch==f.epoch()){complete.trace.receipt();Protocol.CHANNEL.sendToServer(new Protocol.Receipt(f.epoch(),f.transfer()));}}
+            }
         }catch(RuntimeException e){failed(s,e);}
     }
     public static void reply(Protocol.Reply r){
-        Session s=session;if(s==null||r.epoch()!=s.epoch)return;
+        Session s=session;if(s!=null)s.receive(()->{try{reply(s,r);}catch(RuntimeException e){failed(s,e);}});
+    }
+    private static void reply(Session s,Protocol.Reply r){
+        if(s.closed||r.epoch()!=s.epoch)return;
         if(DebugLog.verbose())DebugLog.log("CLIENT reply epoch={} x={} z={} request_id={} version={} level={} status={}",r.epoch(),r.x(),r.z(),r.requestId(),r.version(),r.level(),r.status());
         long p=ChunkPos.asLong(r.x(),r.z());
         if(!currentRequest(s,p,r.requestId()))return;
-        if(r.status()==0){var request=s.pending.get(p);synchronized(request){request.applying=true;}s.deferredReplies.add(r);drainMainWork(s);return;}
+        if(r.status()==0){var request=s.pending.get(p);request.applying=true;completed(s,r.epoch(),p,r.requestId(),r.version(),"unchanged");return;}
         s.pending.remove(p);
         if(r.status()==3){
             if(r.version()<s.versions.getOrDefault(p,0L)){s.invalid.add(p);s.retries.remove(p);refill(s);return;}
@@ -519,12 +533,16 @@ public final class RemoteClient {
             s.budgetInsufficient.put(p,r.level());s.invalid.remove(p);s.retries.remove(p);
             refill(s);return;
         }
-        if(r.status()==2&&s.level.getChunkSource().getChunk(r.x(),r.z(),ChunkStatus.FULL,false)!=null){s.fullRetry.add(p);s.retries.remove(p);}
+        if(r.status()==2&&s.loadedFull.contains(p)){s.fullRetry.add(p);s.retries.remove(p);}
         else retry(s,p,r.status()==1?"server_retry":"unavailable");
         refill(s);
     }
     public static void batchFragment(Protocol.BatchFragment f) {
         Session s=session;if(s==null||s.closed||f.epoch()!=s.epoch){if(DebugLog.verbose())DebugLog.log("CLIENT discard epoch={} transfer={} reason=inactive_epoch",f.epoch(),f.transfer());return;}
+        s.receive(()->batchFragment(s,f));
+    }
+    private static void batchFragment(Session s,Protocol.BatchFragment f){
+        if(s.closed||f.epoch()!=s.epoch)return;
         try {
             ColumnCodec.bounded(f.totalLength(),1,ColumnCodec.MAX_BYTES);ColumnCodec.bounded(f.rawLength(),1,ColumnCodec.MAX_BYTES);
             ColumnCodec.bounded(f.offset(),0,f.totalLength());if(f.bytes().length==0||f.bytes().length>f.totalLength()-f.offset())throw new IllegalArgumentException("Invalid batch fragment range");
@@ -563,9 +581,8 @@ public final class RemoteClient {
                 a.trace.fragment(f.offset(),f.bytes().length,f.totalLength(),f.rawLength(),a.header.members().size());
                 if(a.offset!=a.bytes.length)return;s.batchAssemblies.remove(f.transfer());complete=a;
             }
-            long queued=DebugLog.start();
-            s.worker.execute(()->{
-                DebugLog.end(CLIENT_QUEUE,queued);long started=System.nanoTime();String result="discarded";
+            {
+                long started=System.nanoTime();String result="discarded";
                 try{
                     if(s.closed||s.epoch!=f.epoch())return;
                     long decode=DebugLog.start();byte[] raw=ColumnCodec.uncompress(new ColumnCodec.Encoded(f.compressed(),f.rawLength(),complete.bytes));
@@ -587,108 +604,128 @@ public final class RemoteClient {
                         long lock=DebugLog.start();
                         synchronized(coverage){
                             DebugLog.end(CLIENT_COVERAGE_LOCK,lock);
-                            if(session==s&&s.epoch==f.epoch()&&currentRequest(s,p,m.requestId())&&!s.loadedFull.contains(p)&&column.version()>=latest){long apply=DebugLog.start();int conflicts=coverage.conflicts(column.x(),column.z(),s.hello.minY(),s.hello.maxY(),column.version());if(conflicts>0){DebugLog.count(CLIENT_OLD_VERSION_REPLACED);if(DebugLog.verbose())DebugLog.log("CLIENT authoritative_replace x={} z={} reply_version={} newer_sections={}",column.x(),column.z(),column.version(),conflicts);}CoarseLodReceiver.receive(s.engine,column,s.level.registryAccess(),true,batch);complete.trace.apply+=DebugLog.end(CLIENT_APPLY,apply);s.applied++;complete.trace.applied++;}
+                            if(session==s&&s.epoch==f.epoch()&&currentRequest(s,p,m.requestId())&&!s.loadedFull.contains(p)&&column.version()>=latest){long apply=DebugLog.start();int conflicts=coverage.conflicts(column.x(),column.z(),s.hello.minY(),s.hello.maxY(),column.version());if(conflicts>0){DebugLog.count(CLIENT_OLD_VERSION_REPLACED);if(DebugLog.verbose())DebugLog.log("CLIENT authoritative_replace x={} z={} reply_version={} newer_sections={}",column.x(),column.z(),column.version(),conflicts);}CoarseLodReceiver.receive(s.engine,column,s.registries,true,batch);complete.trace.apply+=DebugLog.end(CLIENT_APPLY,apply);s.applied++;complete.trace.applied++;}
                         }
                         if(DebugLog.verbose())DebugLog.log("CLIENT column epoch={} transfer={} x={} z={} request_id={} level={} version={} latest={} raw_bytes={} applied={}",f.epoch(),f.transfer(),m.x(),m.z(),m.requestId(),m.level(),m.version(),latest,m.rawLength(),currentRequest(s,p,m.requestId())&&column.version()>=latest);
                         completed(s,f.epoch(),p,m.requestId(),m.version(),"batch");
                     }}finally{batch.finish();}
                     result="ok";
                 }catch(RuntimeException e){result="failed";if(DebugLog.enabled())DebugLog.log("CLIENT failed epoch={} transfer={} error={}",f.epoch(),f.transfer(),e.toString());failed(s,e);}
-                finally{long paced=System.nanoTime();pace(started);complete.trace.applied(started,paced,result);s.memory.addAndGet(-complete.reservation);long receiptQueued=DebugLog.start();Minecraft.getInstance().execute(()->{DebugLog.end(CLIENT_RECEIPT_CONTROL,receiptQueued);if(session==s&&s.epoch==f.epoch()){complete.trace.receipt();Protocol.CHANNEL.sendToServer(new Protocol.Receipt(f.epoch(),f.transfer()));}});}
-            });
+                finally{long paced=System.nanoTime();pace(started);complete.trace.applied(started,paced,result);s.memory.addAndGet(-complete.reservation);if(session==s&&s.epoch==f.epoch()){complete.trace.receipt();Protocol.CHANNEL.sendToServer(new Protocol.Receipt(f.epoch(),f.transfer()));}}
+            }
         }catch(RuntimeException e){failed(s,e);}
     }
-    public static void abort(Protocol.Abort a){Session s=session;if(s==null||s.epoch!=a.epoch())return;synchronized(s.assemblies){s.discardedBatches.remove(a.transfer());Assembly removed=s.assemblies.remove(a.transfer());if(removed!=null){s.memory.addAndGet(-removed.reservation);long p=ChunkPos.asLong(removed.header.x(),removed.header.z());if(currentRequest(s,p,removed.header.requestId())){s.pending.remove(p);s.invalid.add(p);}}BatchAssembly batch=s.batchAssemblies.remove(a.transfer());if(batch!=null){s.memory.addAndGet(-batch.reservation);for(var m:batch.header.members()){long p=ChunkPos.asLong(m.x(),m.z());if(currentRequest(s,p,m.requestId())){s.pending.remove(p);s.invalid.add(p);}}}}Protocol.CHANNEL.sendToServer(new Protocol.Receipt(a.epoch(),a.transfer()));}
+    public static void abort(Protocol.Abort a){Session s=session;if(s!=null)s.receive(()->{try{abort(s,a);}catch(RuntimeException e){failed(s,e);}});}
+    private static void abort(Session s,Protocol.Abort a){if(s.closed||s.epoch!=a.epoch())return;synchronized(s.assemblies){s.discardedBatches.remove(a.transfer());Assembly removed=s.assemblies.remove(a.transfer());if(removed!=null){s.memory.addAndGet(-removed.reservation);long p=ChunkPos.asLong(removed.header.x(),removed.header.z());if(currentRequest(s,p,removed.header.requestId())){s.pending.remove(p);s.invalid.add(p);}}BatchAssembly batch=s.batchAssemblies.remove(a.transfer());if(batch!=null){s.memory.addAndGet(-batch.reservation);for(var m:batch.header.members()){long p=ChunkPos.asLong(m.x(),m.z());if(currentRequest(s,p,m.requestId())){s.pending.remove(p);s.invalid.add(p);}}}}Protocol.CHANNEL.sendToServer(new Protocol.Receipt(a.epoch(),a.transfer()));}
     public static void dirty(Protocol.Dirty d) {
-        if(greeting==null||!greeting.dimension().equals(d.dimension()))return;
+        var hello=greeting;if(hello==null||!hello.dimension().equals(d.dimension()))return;
         Session s=session;long pos=ChunkPos.asLong(d.x(),d.z());if(s==null){initialVersions.merge(pos,d.version(),Math::max);return;}
-        long previous=s.versions.getOrDefault(pos,0L);s.versions.merge(pos,d.version(),Math::max);s.checked.remove(pos);s.retries.remove(pos);if(d.version()>previous)s.budgetInsufficient.remove(pos);if(!d.vanilla())s.invalid.add(pos);
-        s.discovery.dirty(pos);
+        long previous=s.versions.getOrDefault(pos,0L);s.versions.merge(pos,d.version(),Math::max);
         invalidateSnapshots(s,d.x(),d.z());
+        if(d.vanilla())s.vanillaDirty.add(pos);
+        else s.receive(()->{try{dirty(s,d,pos,previous);}catch(RuntimeException e){failed(s,e);}});
+    }
+    private static void dirty(Session s,Protocol.Dirty d,long pos,long previous){
+        if(s.closed)return;
+        s.checked.remove(pos);s.retries.remove(pos);if(d.version()>previous)s.budgetInsufficient.remove(pos);if(!d.vanilla())s.invalid.add(pos);
+        s.discovery.dirty(pos);
         // A revision applies to the whole column, even when vanilla changed only one section.
         // Recapture loaded columns after the following vanilla packet has run on the main thread.
         s.fullRetry.add(pos);
         // Keep the existing render hierarchy while requiring a fresh revision for cache hits.
-        s.deferredDirty.merge(pos,d.version(),Math::max);drainMainWork(s);
-    }
-    private static void drainMainWork(Session s){
-        while(!s.deferredDirty.isEmpty()){
-            var entry=s.deferredDirty.entrySet().iterator().next();long p=entry.getKey(),version=entry.getValue();int x=ChunkPos.getX(p),z=ChunkPos.getZ(p);
-            if(!s.offer(()->{try{var coverage=VoxyBridge.coverage(s.engine);synchronized(coverage){if(!s.closed)coverage.restrict(x,z,s.hello.minY(),s.hello.maxY(),version);}}catch(RuntimeException e){failed(s,e);}}))return;
-            s.deferredDirty.remove(p);
-        }
-        while(!s.deferredReplies.isEmpty()){
-            var reply=s.deferredReplies.peek();long p=ChunkPos.asLong(reply.x(),reply.z());
-            if(!s.offer(()->{try{if(!s.closed&&s.epoch==reply.epoch())completed(s,reply.epoch(),p,reply.requestId(),reply.version(),"unchanged");}catch(RuntimeException e){failed(s,e);}}))return;
-            s.deferredReplies.remove();
-        }
-        if(s.activePending){int x=s.activeX,z=s.activeZ,radius=s.activeRadius;if(s.offer(()->VoxyBridge.coverage(s.engine).active(x,z,radius)))s.activePending=false;}
-        if(s.checkpointPending&&s.offer(()->{long timing=DebugLog.start();try{VoxyBridge.coverage(s.engine).checkpointIfDue(s.engine.storage::flush);}catch(RuntimeException e){failed(s,e);}finally{DebugLog.end(CLIENT_CHECKPOINT,timing);}}))s.checkpointPending=false;
+        VoxyBridge.coverage(s.engine).restrict(d.x(),d.z(),s.hello.minY(),s.hello.maxY(),d.version());
     }
     public static boolean handles(WorldEngine world){Session s=session;return s!=null&&!s.closed&&s.engine==world;}
     public static float renderRadiusSquared(){Session s=session;if(s==null||s.closed)return -1;float blocks=Math.min(s.radius,VoxyBridge.radiusChunks())*16f;return blocks*blocks;}
     public static void lightPending(net.minecraft.client.multiplayer.ClientLevel level,int x,int z){
         if(lightLevel!=level){lightLevel=level;lightReady.clear();}
         lightReady.remove(ChunkPos.asLong(x,z));
-        Session s=session;if(s!=null&&s.level==level)invalidateSnapshots(s,x,z);
+        Session s=session;if(s!=null&&s.level==level){s.loadedFull.add(ChunkPos.asLong(x,z));invalidateSnapshots(s,x,z);}
     }
     public static void lightApplied(net.minecraft.client.multiplayer.ClientLevel level,int x,int z){
         if(lightLevel!=level){lightLevel=level;lightReady.clear();}
         if(level.getChunkSource().getChunk(x,z,ChunkStatus.FULL,false)==null)return;
         long p=ChunkPos.asLong(x,z);lightReady.add(p);
-        Session s=session;if(s!=null&&s.level==level&&!s.closed){invalidateSnapshots(s,x,z);s.fullRetry.add(p);}
+        Session s=session;if(s!=null&&s.level==level&&!s.closed){s.loadedFull.add(p);invalidateSnapshots(s,x,z);s.captures.put(p,0);}
     }
     public static void unload(LevelChunk chunk){
         long p=chunk.getPos().toLong();lightReady.remove(p);
         Session s=session;if(s==null||s.closed||chunk.getLevel()!=s.level)return;
-        s.loadedFull.remove(p);s.checked.remove(p);s.retries.remove(p);s.fullRetry.remove(p);
+        s.loadedFull.remove(p);s.fullRetry.remove(p);s.captures.remove(p);s.captureRequested.remove(p);s.unloaded.add(p);
         invalidateSnapshots(s,chunk.getPos().x,chunk.getPos().z);
-        if(inRange(s,chunk.getPos().x,chunk.getPos().z))s.invalid.add(p);
     }
     public static boolean full(WorldEngine world,LevelChunk chunk) {
         Session s=session;if(s==null||s.engine!=world||s.closed)return false;
         if(maintenancePaused)return true;
         long p=chunk.getPos().toLong();s.loadedFull.add(p);
-        if(lightLevel!=s.level||!lightReady.contains(p)){s.fullRetry.add(p);return true;}
-        for(int i=0;i<chunk.getSectionsCount();i++) {
-            int y=chunk.getMinSection()+i;var pos=SectionPos.of(chunk.getPos(),y);var light=chunk.getLevel().getLightEngine();
-            snapshot(world,chunk.getSections()[i],chunk.getPos().x,y,chunk.getPos().z,light.getLayerListener(LightLayer.BLOCK).getDataLayerData(pos),light.getLayerListener(LightLayer.SKY).getDataLayerData(pos));
-        }return true;
+        if(s.captures.putIfAbsent(p,0)==null)invalidateSnapshots(s,chunk.getPos().x,chunk.getPos().z);return true;
     }
     public static void snapshot(WorldEngine world,LevelChunkSection section,int x,int y,int z,DataLayer block,DataLayer sky) {
         if(maintenancePaused)return;
         Session s=session;if(s==null||s.engine!=world||s.closed)return;
-        long p=ChunkPos.asLong(x,z);
         long key=SectionPos.asLong(x,y,z);
-        if(lightLevel!=s.level||!lightReady.contains(p)){s.latestSnapshots.remove(key);s.fullRetry.add(p);return;}
-        long version=s.versions.getOrDefault(p,0L);if(version==0)return;
-        if(s.worker.getQueue().size()>=256){s.latestSnapshots.remove(key);s.deferredSnapshots.add(p);return;}
-        long bytes=ChunkSnapshot.RESERVED_BYTES;if(s.snapshotMemory.addAndGet(bytes)>s.snapshotLimit){s.snapshotMemory.addAndGet(-bytes);s.latestSnapshots.remove(key);Minecraft.getInstance().execute(()->{if(session==s)s.fullRetry.add(ChunkPos.asLong(x,z));});return;}s.memory.addAndGet(bytes);
+        s.latestSnapshots.remove(key);s.sectionCaptures.add(key);
+    }
+    private static void capture(Session s){
+        if(maintenancePaused)return;
+        long deadline=System.nanoTime()+500_000L;
+        for(long p:s.captureRequested){if(System.nanoTime()>=deadline)break;if(s.captureRequested.remove(p))s.captures.put(p,0);}
+        if(s.worker.getQueue().size()>=256||s.snapshotMemory.get()+ChunkSnapshot.RESERVED_BYTES>s.snapshotLimit)return;
+        for(var it=s.sectionCaptures.iterator();it.hasNext()&&System.nanoTime()<deadline;){
+            long key=it.next();int x=SectionPos.x(key),y=SectionPos.y(key),z=SectionPos.z(key);long p=ChunkPos.asLong(x,z);
+            if(s.latestSnapshots.containsKey(key))continue;
+            var chunk=s.level.getChunkSource().getChunk(x,z,ChunkStatus.FULL,false);
+            if(chunk==null){it.remove();continue;}
+            if(!lightReady.contains(p))continue;
+            if(!capture(s,chunk,y))return;it.remove();
+        }
+        for(var it=s.captures.entrySet().iterator();it.hasNext()&&System.nanoTime()<deadline;){
+            var entry=it.next();long p=entry.getKey();
+            var chunk=s.level.getChunkSource().getChunk(ChunkPos.getX(p),ChunkPos.getZ(p),ChunkStatus.FULL,false);
+            if(chunk==null){it.remove();s.loadedFull.remove(p);s.unloaded.add(p);continue;}
+            if(!lightReady.contains(p))continue;
+            if(s.versions.getOrDefault(p,0L)==0){it.remove();continue;}
+            int section=entry.getValue();
+            if(s.latestSnapshots.containsKey(SectionPos.asLong(chunk.getPos().x,chunk.getMinSection()+section,chunk.getPos().z)))continue;
+            while(section<chunk.getSectionsCount()&&System.nanoTime()<deadline){if(!capture(s,chunk,chunk.getMinSection()+section))return;entry.setValue(++section);}
+            if(section==chunk.getSectionsCount())it.remove();
+        }
+    }
+    private static boolean capture(Session s,LevelChunk chunk,int y){
+        int x=chunk.getPos().x,z=chunk.getPos().z;long p=chunk.getPos().toLong(),key=SectionPos.asLong(x,y,z),version=s.versions.getOrDefault(p,0L);
+        if(version==0)return true;
+        if(s.worker.getQueue().size()>=256||s.latestSnapshots.containsKey(key))return false;
+        long bytes=ChunkSnapshot.RESERVED_BYTES;
+        if(s.snapshotMemory.addAndGet(bytes)>s.snapshotLimit){s.snapshotMemory.addAndGet(-bytes);return false;}s.memory.addAndGet(bytes);
+        var section=chunk.getSections()[y-chunk.getMinSection()];var pos=SectionPos.of(x,y,z);var light=s.level.getLightEngine();
+        var block=light.getLayerListener(LightLayer.BLOCK).getDataLayerData(pos);var sky=light.getLayerListener(LightLayer.SKY).getDataLayerData(pos);
         var biomes=section.getBiomes().recreate();for(int by=0;by<4;by++)for(int bz=0;bz<4;bz++)for(int bx=0;bx<4;bx++)biomes.getAndSetUnchecked(bx,by,bz,section.getBiomes().get(bx,by,bz));
         var snapshot=new ChunkSnapshot(x,y,z,section.getStates().copy(),biomes,block==null?null:block.copy(),sky==null?null:sky.copy());int epoch=s.epoch;
         // Retire only a queued predecessor after the new immutable capture exists.
         DebugLog.count(CLIENT_SNAPSHOT_CAPTURE);s.latestSnapshots.put(key,snapshot);
         if(!s.offer(()->{
-            long started=System.nanoTime();try{synchronized(VoxyBridge.coverage(world)){if(!s.closed&&s.epoch==epoch&&version>=s.versions.getOrDefault(ChunkPos.asLong(x,z),0L)){if(s.latestSnapshots.get(key)==snapshot){VoxyBridge.ingestRemote(world,snapshot,version);var stamp=VoxyBridge.coverage(world).directoryColumn(x,z);Minecraft.getInstance().execute(()->{if(session==s&&s.epoch==epoch)s.discovery.updated(p,stamp.version()>=s.versions.getOrDefault(p,0L)?stamp:new CoverageStore.Stamp(0,5));});}else DebugLog.count(CLIENT_SNAPSHOT_SUPERSEDED);}}}
+            long started=System.nanoTime();try{synchronized(VoxyBridge.coverage(s.engine)){if(!s.closed&&s.epoch==epoch&&version>=s.versions.getOrDefault(p,0L)){if(s.latestSnapshots.get(key)==snapshot){VoxyBridge.ingestRemote(s.engine,snapshot,version);var stamp=VoxyBridge.coverage(s.engine).directoryColumn(x,z);s.discovery.updated(p,stamp.version()>=s.versions.getOrDefault(p,0L)?stamp:new CoverageStore.Stamp(0,5));}else DebugLog.count(CLIENT_SNAPSHOT_SUPERSEDED);}}}
             catch(RuntimeException e){failed(s,e);}finally{s.latestSnapshots.remove(key,snapshot);pace(started);s.memory.addAndGet(-bytes);s.snapshotMemory.addAndGet(-bytes);}
         })){
             s.latestSnapshots.remove(key,snapshot);
-            s.memory.addAndGet(-bytes);s.snapshotMemory.addAndGet(-bytes);s.deferredSnapshots.add(p);
+            s.memory.addAndGet(-bytes);s.snapshotMemory.addAndGet(-bytes);return false;
         }
+        return true;
     }
     private static void invalidateSnapshots(Session s,int x,int z){
-        for(int y=s.level.getMinSection();y<s.level.getMaxSection();y++)s.latestSnapshots.remove(SectionPos.asLong(x,y,z));
+        for(int y=s.hello.minY();y<s.hello.maxY();y++)s.latestSnapshots.remove(SectionPos.asLong(x,y,z));
     }
     private static void pace(long started){double duty=DistantConfig.RECEIVE_DUTY.get();if(duty<1){long timing=DebugLog.start();java.util.concurrent.locks.LockSupport.parkNanos((long)((System.nanoTime()-started)*(1/duty-1)));DebugLog.end(CLIENT_PACE,timing);}}
-    private static void failed(Session s,RuntimeException e){failure=e.toString();LOG.error("Voxy Distant receive failed",e);Minecraft.getInstance().execute(()->{if(session==s){s.radius=0;send(s,List.of());close();greeting=null;}});}
+    private static void failed(Session s,RuntimeException e){failure=e.toString();LOG.error("Voxy Distant receive failed",e);Minecraft.getInstance().execute(()->{if(session==s){Protocol.CHANNEL.sendToServer(new Protocol.Requests(s.epoch,0,s.view,DistantConfig.DOWNLOAD_KBPS.get(),s.networkCapacity,List.of()));close();greeting=null;}});}
     public static String status(){if(maintenancePaused)return "服务端正在导入远景";Session s=session;return s==null?(failure.isEmpty()?"无服务端远景会话":failure):String.format(Locale.ROOT,"接收 %d 列 · %.1f MiB · 缓冲 %.1f MiB · 请求 %d%s",s.applied,s.received/1048576.0,s.memory.get()/1048576.0,s.pending.size(),s.budgetInsufficient.isEmpty()?"":" · 信用不足 "+s.budgetInsufficient.size()+" 列");}
     public static void close(){
         Session s=session;if(s==null)return;
-        // Finish the current write before handing ingest back; queued work rechecks closed under this lock.
-        synchronized(VoxyBridge.coverage(s.engine)){s.closed=true;session=null;}
+        s.closed=true;session=null;
         if(DebugLog.enabled())DebugLog.log("CLIENT close epoch={} applied={} payload_bytes={} pending={} worker_queue={}",s.epoch,s.applied,s.received,s.pending.size(),s.worker.getQueue().size());
-        synchronized(s.assemblies){for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();s.discardedBatches.clear();}
-        s.releaseOnTermination=true;s.worker.shutdown();retired.add(s);
+        s.releaseOnTermination=true;
+        // Cleanup stays behind the current write; the game thread never waits for its monitor.
+        s.worker.getQueue().clear();s.offer(()->{for(var a:s.assemblies.values())s.memory.addAndGet(-a.reservation);s.assemblies.clear();for(var a:s.batchAssemblies.values())s.memory.addAndGet(-a.reservation);s.batchAssemblies.clear();s.discardedBatches.clear();});
+        s.worker.shutdown();retired.add(s);
     }
     public static void shutdown(){close();try{for(Session s:retired)while(!s.worker.awaitTermination(1,TimeUnit.SECONDS)){}retired.clear();}catch(InterruptedException e){Thread.currentThread().interrupt();throw new IllegalStateException(e);}}
     private RemoteClient(){}

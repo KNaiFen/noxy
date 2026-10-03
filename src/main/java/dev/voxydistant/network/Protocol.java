@@ -65,9 +65,9 @@ public final class Protocol {
         CHANNEL.registerMessage(13,RegionQuery.class,(m,b)->{b.writeInt(m.epoch);b.writeLong(m.id);b.writeInt(m.x);b.writeInt(m.z);},
                 b->new RegionQuery(b.readInt(),b.readLong(),b.readInt(),b.readInt()),(m,c)->{var ctx=c.get();ctx.enqueueWork(()->RemoteServer.regionQuery(ctx.getSender(),m));ctx.setPacketHandled(true);},Optional.of(NetworkDirection.PLAY_TO_SERVER));
         CHANNEL.registerMessage(14,RegionSummary.class,Protocol::writeRegion,Protocol::readRegion,
-                (m,c)->client(c,()->RemoteClient.regionSummary(m)),Optional.of(NetworkDirection.PLAY_TO_CLIENT));
+                (m,c)->clientAsync(c,()->RemoteClient.regionSummary(m)),Optional.of(NetworkDirection.PLAY_TO_CLIENT));
         CHANNEL.registerMessage(10, Maintenance.class, (m,b)->b.writeBoolean(m.paused), b->new Maintenance(b.readBoolean()),
-                (m,c)->client(c,()->RemoteClient.maintenance(m)), Optional.of(NetworkDirection.PLAY_TO_CLIENT));
+                (m,c)->clientAsync(c,()->RemoteClient.maintenance(m)), Optional.of(NetworkDirection.PLAY_TO_CLIENT));
         CHANNEL.registerMessage(0, Hello.class, (m,b) -> {
             b.writeUUID(m.world);b.writeUtf(m.dimension,256); b.writeVarInt(m.radius); b.writeInt(m.minY); b.writeInt(m.maxY);
             b.writeVarInt(m.bands.size()); m.bands.forEach(s -> b.writeUtf(s, 32));
@@ -100,12 +100,16 @@ public final class Protocol {
         }, Optional.of(NetworkDirection.PLAY_TO_CLIENT));
         CHANNEL.registerMessage(3, Reply.class, (m,b) -> { b.writeInt(m.epoch); b.writeInt(m.x); b.writeInt(m.z); b.writeLong(m.version); b.writeByte(m.level); b.writeLong(m.requestId);b.writeByte(m.status); },
                 b -> new Reply(b.readInt(),b.readInt(),b.readInt(),b.readLong(),b.readUnsignedByte(),b.readLong(),b.readUnsignedByte()),
-                (m,c) -> client(c, () -> RemoteClient.reply(m)), Optional.of(NetworkDirection.PLAY_TO_CLIENT));
+                (m,c) -> clientAsync(c, () -> RemoteClient.reply(m)), Optional.of(NetworkDirection.PLAY_TO_CLIENT));
         CHANNEL.registerMessage(4, Receipt.class, (m,b) -> { b.writeInt(m.epoch); b.writeLong(m.transfer); }, b -> new Receipt(b.readInt(),b.readLong()),
                 (m,c) -> { var ctx=c.get(); long queued=DebugLog.start();ctx.enqueueWork(() -> {DebugLog.end(DebugLog.Metric.SERVER_RECEIPT_CONTROL,queued);RemoteServer.receipt(ctx.getSender(),m);}); ctx.setPacketHandled(true); }, Optional.of(NetworkDirection.PLAY_TO_SERVER));
         CHANNEL.registerMessage(5, Dirty.class, (m,b) -> {b.writeUtf(m.dimension,256); b.writeInt(m.x); b.writeInt(m.z); b.writeLong(m.version); b.writeBoolean(m.vanilla); },
-                b -> new Dirty(b.readUtf(256),b.readInt(),b.readInt(),b.readLong(),b.readBoolean()), (m,c) -> client(c, () -> RemoteClient.dirty(m)), Optional.of(NetworkDirection.PLAY_TO_CLIENT));
-        CHANNEL.registerMessage(6,Abort.class,(m,b)->{b.writeInt(m.epoch);b.writeLong(m.transfer);},b->new Abort(b.readInt(),b.readLong()),(m,c)->client(c,()->RemoteClient.abort(m)),Optional.of(NetworkDirection.PLAY_TO_CLIENT));
+                b -> new Dirty(b.readUtf(256),b.readInt(),b.readInt(),b.readLong(),b.readBoolean()), (m,c) -> {
+                    // Vanilla revision intent stays ordered with the following vanilla packet.
+                    // The hook only invalidates snapshots and publishes work to the receive lane.
+                    if(m.vanilla())client(c,()->RemoteClient.dirty(m));else clientAsync(c,()->RemoteClient.dirty(m));
+                }, Optional.of(NetworkDirection.PLAY_TO_CLIENT));
+        CHANNEL.registerMessage(6,Abort.class,(m,b)->{b.writeInt(m.epoch);b.writeLong(m.transfer);},b->new Abort(b.readInt(),b.readLong()),(m,c)->clientAsync(c,()->RemoteClient.abort(m)),Optional.of(NetworkDirection.PLAY_TO_CLIENT));
         CHANNEL.registerMessage(7,BatchFragment.class,Protocol::writeBatch,Protocol::readBatch,(m,c)->{
             DistExecutor.unsafeRunWhenOn(Dist.CLIENT,()->()->RemoteClient.batchFragment(m));c.get().setPacketHandled(true);
         },Optional.of(NetworkDirection.PLAY_TO_CLIENT));
@@ -149,6 +153,10 @@ public final class Protocol {
     }
     private static void client(Supplier<NetworkEvent.Context> context, Runnable action) {
         context.get().enqueueWork(() -> DistExecutor.unsafeRunWhenOn(Dist.CLIENT, () -> () -> action.run()));
+        context.get().setPacketHandled(true);
+    }
+    private static void clientAsync(Supplier<NetworkEvent.Context> context,Runnable action){
+        DistExecutor.unsafeRunWhenOn(Dist.CLIENT,()->()->action.run());
         context.get().setPacketHandled(true);
     }
     public static void send(ServerPlayer player, Object message) { CHANNEL.send(PacketDistributor.PLAYER.with(() -> player), message); }

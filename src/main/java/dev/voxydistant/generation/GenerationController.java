@@ -29,34 +29,37 @@ public final class GenerationController {
     private static volatile Target target;
     private static volatile Status status = new Status(0, 0, 0, 0, 0, "等待单人世界", "",0,0,0);
     private static volatile boolean stopping;
-    private static WorldEngine offeredEngine;
-    private static ResourceKey<Level> offeredDimension;
+    private record Offer(WorldEngine engine,ResourceKey<Level> dimension){}
+    private static final java.util.concurrent.atomic.AtomicReference<Offer> offered=new java.util.concurrent.atomic.AtomicReference<>();
     private static final List<Session> retired = new ArrayList<>();
-    private static Session session;
+    private static volatile Session session;
 
     public static Status status() { return status; }
 
-    public static synchronized void clientTick() {
+    public static void clientTick() {
         var mc = Minecraft.getInstance();
         if (mc.level == null || mc.player == null || mc.getSingleplayerServer() == null) {
             target = null;
-            if (offeredEngine != null) { offeredEngine.releaseRef(); offeredEngine = null; }
+            var old=offered.getAndSet(null);if(old!=null)old.engine().releaseRef();
             return;
         }
         if (stopping) return;
         var server = mc.getSingleplayerServer();
-        if (offeredEngine != null && offeredDimension != mc.level.dimension()) {
-            offeredEngine.releaseRef(); offeredEngine = null;
-        }
-        if (session == null || session.level.dimension() != mc.level.dimension()) {
-            if (offeredEngine == null) offeredEngine = VoxyBridge.acquire(mc.level);
-            offeredDimension = mc.level.dimension();
+        var offer=offered.get();
+        if(offer!=null&&offer.dimension()!=mc.level.dimension()&&offered.compareAndSet(offer,null)){offer.engine().releaseRef();offer=null;}
+        var active=session;
+        if(active!=null&&active.level.dimension()==mc.level.dimension()){
+            if(offer!=null&&offered.compareAndSet(offer,null))offer.engine().releaseRef();
+        }else if(offer==null) {
+            var engine=VoxyBridge.acquire(mc.level);if(engine!=null)offered.set(new Offer(engine,mc.level.dimension()));
         }
         var previous=target;
+        var motion=dev.voxydistant.movement.MovementPrediction.CLIENT.snapshot();
+        if(motion.world()!=mc.level){target=null;return;}
         target = new Target(server, mc.level.dimension(), mc.player.chunkPosition().x, mc.player.chunkPosition().z,
                 Math.max(mc.options.renderDistance().get(), server.getPlayerList().getViewDistance()),
                 Math.min(DistantConfig.RADIUS.get(), VoxyBridge.radiusChunks()),
-                mc.isPaused() || mc.screen != null && mc.screen.isPauseScreen(),dev.voxydistant.movement.MovementPrediction.CLIENT.snapshot());
+                mc.isPaused() || mc.screen != null && mc.screen.isPauseScreen(),motion);
         // IntegratedServer skips Forge tick events while paused, but still drains its task queue.
         if(target.paused()&&(previous==null||!previous.paused()||status.generating()>0||status.converting()>0))server.execute(()->serverTick(server));
     }
@@ -72,9 +75,8 @@ public final class GenerationController {
         }
         if (desired == null || desired.server() != server) return;
         if (session == null) {
-            if (offeredEngine == null) return;
-            session = new Session(server.getLevel(desired.dimension()), offeredEngine);
-            offeredEngine = null;
+            var offer=offered.get();if(offer==null||offer.dimension()!=desired.dimension()||!offered.compareAndSet(offer,null))return;
+            session = new Session(server.getLevel(desired.dimension()), offer.engine());
         }
         session.tick(desired);
     }
@@ -85,7 +87,7 @@ public final class GenerationController {
             retired.add(session);
             session = null;
         }
-        if (offeredEngine != null) { offeredEngine.releaseRef(); offeredEngine = null; }
+        var offer=offered.getAndSet(null);if(offer!=null)offer.engine().releaseRef();
         target = null;
     }
 
@@ -95,7 +97,7 @@ public final class GenerationController {
             stopping = true;
             server = session == null ? null : session.level.getServer();
             target = null;
-            if (offeredEngine != null) { offeredEngine.releaseRef(); offeredEngine = null; }
+            var offer=offered.getAndSet(null);if(offer!=null)offer.engine().releaseRef();
         }
         // Shutdown only: await resource cleanup, never wait for generation futures.
         // During ordinary gameplay every step is polled from server ticks.

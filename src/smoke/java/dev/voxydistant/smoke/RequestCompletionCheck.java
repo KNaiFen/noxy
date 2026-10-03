@@ -35,6 +35,9 @@ public final class RequestCompletionCheck {
         var retries=(dev.voxydistant.client.RetryQueue)field(type,"retries").get(session);
         var pending=(Map<Long,Object>)field(type,"pending").get(session);
         var pendingType=Class.forName("dev.voxydistant.client.RemoteClient$Pending");var pendingConstructor=pendingType.getDeclaredConstructors()[0];pendingConstructor.setAccessible(true);
+        var vanillaChunk=mc.level.getChunk(0,0);
+        var frameType=Class.forName("dev.voxydistant.client.RemoteClient$Frame");var frameConstructor=frameType.getDeclaredConstructors()[0];frameConstructor.setAccessible(true);
+        Object input=frameConstructor.newInstance(0,0,2,64,64,false);
         // An older position requires L2; move into L0 range before delivering its response.
         mc.player.setPos(-256,180,0);
         int oldTarget=dev.voxydistant.config.DistanceBands.parse(hello.bands()).select(4,0,mc.player.chunkPosition().x,mc.player.chunkPosition().z);
@@ -65,18 +68,21 @@ public final class RequestCompletionCheck {
         },mc);
         chain=chain.thenRunAsync(()->{},worker).thenRunAsync(()->{
             check(!invalid.contains(p)&&checked.get(p)==0,"latest fine response satisfies stationary demand");
+        },mc).thenRunAsync(()->{
             long overlap=ChunkPos.asLong(55,0);
             try{pending.put(overlap,pendingConstructor.newInstance(System.nanoTime(),2,2,2L));}
             catch(ReflectiveOperationException e){throw new CompletionException(e);}
-            RemoteClient.reply(new Protocol.Reply(epoch,55,0,0,5,1L,1));
+            reply(session,type,new Protocol.Reply(epoch,55,0,0,5,1L,1));
             check(pending.containsKey(overlap),"late retry must not clear a newer request at the same coordinate");
-            long missing=ChunkPos.asLong(60,0);pending.put(missing,original);RemoteClient.reply(new Protocol.Reply(epoch,60,0,0,5,2));
+            long missing=ChunkPos.asLong(60,0);pending.put(missing,original);reply(session,type,new Protocol.Reply(epoch,60,0,0,5,2));
             check(!checked.containsKey(missing)&&retries.scheduled(missing),"unavailable is delayed, never fake L0");
-            RemoteClient.dirty(new Protocol.Dirty(hello.dimension(),60,0,version,false));
+            versions.put(missing,version);try{var dirty=RemoteClient.class.getDeclaredMethod("dirty",type,Protocol.Dirty.class,long.class,long.class);dirty.setAccessible(true);dirty.invoke(null,session,new Protocol.Dirty(hello.dimension(),60,0,version,false),missing,0L);}catch(ReflectiveOperationException e){throw new CompletionException(e);}
             check(!retries.scheduled(missing)&&invalid.contains(missing),"dirty wakes sleeping retry");
-            var chunk=mc.level.getChunk(0,0);pending.put(0L,original);RemoteClient.reply(new Protocol.Reply(epoch,0,0,version,5,2));
+            ((Set<Long>)uncheckedField(session,type,"loadedFull")).add(0L);pending.put(0L,original);reply(session,type,new Protocol.Reply(epoch,0,0,version,5,2));
             check(fullRetry.contains(0L),"available vanilla chunk queues ingest");
-            RemoteClient.unload(chunk);check(invalid.contains(0L)&&!fullRetry.contains(0L),"vanilla unload rechecks coverage");
+        },worker).thenRunAsync(()->RemoteClient.unload(vanillaChunk),mc).thenRunAsync(()->{
+            try{var tick=RemoteClient.class.getDeclaredMethod("tick",type,frameType);tick.setAccessible(true);tick.invoke(null,session,input);}catch(ReflectiveOperationException e){throw new CompletionException(e);}
+            check(invalid.contains(0L)&&!fullRetry.contains(0L),"vanilla unload rechecks coverage");
             invalid.clear();pending.clear();
             try{
                 for(int z=32;z<40;z++)for(int x=32;x<40;x++)invalid.add(ChunkPos.asLong(x,z));
@@ -100,7 +106,7 @@ public final class RequestCompletionCheck {
             try{sessionField.set(null,session);}catch(IllegalAccessException e){throw new CompletionException(e);}
             pending.clear();invalid.clear();
             System.out.println("DISTANT_REQUEST_COMPLETION_PASS: single/batch/unchanged stationary refinement, stale revision, unavailable, vanilla unload, dirty wake, scan fairness, session switch");
-        },mc);
+        },worker);
         long delayed=ChunkPos.asLong(55,0);
         chain=chain.thenRunAsync(()->{
             try{pending.put(delayed,pendingConstructor.newInstance(System.nanoTime(),2,2,2L));}
@@ -122,10 +128,27 @@ public final class RequestCompletionCheck {
             RemoteClient.abort(new Protocol.Abort(epoch,23));
             check(pending.containsKey(delayed),"late abort cannot clear newer request");
         },mc);
+        chain=chain.thenCompose(unused->{
+            var locked=new CompletableFuture<Void>();var release=new java.util.concurrent.CountDownLatch(1);
+            worker.execute(()->{synchronized(VoxyBridge.coverage(engine)){
+                locked.complete(null);
+                try{check(release.await(5,java.util.concurrent.TimeUnit.SECONDS),"main-thread hooks must not wait for coverage worker");}
+                catch(InterruptedException e){Thread.currentThread().interrupt();throw new CompletionException(e);}
+            }});
+            return locked.thenRunAsync(()->{
+                try{
+                    long started=System.nanoTime();
+                    RemoteClient.tick();RemoteClient.indexStatus();RemoteClient.receiveSpeed();RemoteClient.full(engine,vanillaChunk);RemoteClient.close();
+                    long elapsed=System.nanoTime()-started;
+                    check(elapsed<50_000_000L,"tick, status, hooks and close must not wait for background coverage lock: "+elapsed);
+                    System.out.println("DISTANT_ASYNC_MAIN_PASS: background coverage locked, main hooks elapsed_us="+(elapsed/1000));
+                }finally{release.countDown();}
+            },mc);
+        });
         return chain.whenCompleteAsync((unused,error)->{
             try{sessionField.set(null,null);paused.setBoolean(null,oldPaused);field(type,"closed").setBoolean(session,true);}
             catch(ReflectiveOperationException e){throw new CompletionException(e);}
-            finally{dev.voxydistant.config.DistantConfig.RECEIVE.set(oldReceive);worker.execute(engine::releaseRef);worker.shutdown();}
+            finally{dev.voxydistant.config.DistantConfig.RECEIVE.set(oldReceive);if(!worker.isShutdown()){worker.execute(engine::releaseRef);worker.shutdown();}}
         },mc);
     }
     private static LodColumn column(Minecraft mc,int x,int z,long version,int level){
@@ -133,6 +156,11 @@ public final class RequestCompletionCheck {
         for(var section:sections){section[level]=new long[4096>>(level*3)];Arrays.fill(section[level],LodColumn.voxel(1,0,0xf3,15));}
         return new LodColumn(x,z,mc.level.getMinSection(),version,List.of(Blocks.AIR.defaultBlockState(),Blocks.STONE.defaultBlockState()),List.of("minecraft:plains"),sections);
     }
+    private static void reply(Object session,Class<?> type,Protocol.Reply packet){
+        try{var method=RemoteClient.class.getDeclaredMethod("reply",type,Protocol.Reply.class);method.setAccessible(true);method.invoke(null,session,packet);}
+        catch(ReflectiveOperationException e){throw new CompletionException(e);}
+    }
+    private static Object uncheckedField(Object session,Class<?> type,String name){try{return field(type,name).get(session);}catch(ReflectiveOperationException e){throw new CompletionException(e);}}
     private static void packet(int epoch,long transfer,LodColumn column,boolean batch){packet(epoch,transfer,column,batch,0L);}
     private static void packet(int epoch,long transfer,LodColumn column,boolean batch,long requestId){
         int level=column.minimumLevel();byte[] raw=ColumnCodec.encodeRaw(column,1<<level);

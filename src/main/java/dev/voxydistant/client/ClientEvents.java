@@ -28,7 +28,7 @@ public final class ClientEvents {
         if (event.phase == TickEvent.Phase.END) {
             var mc=net.minecraft.client.Minecraft.getInstance();var player=mc.player;
             var config=new dev.voxydistant.movement.MovementPrediction.Settings(dev.voxydistant.config.DistantConfig.MOVEMENT_PREDICTION.get(),dev.voxydistant.config.DistantConfig.MOVEMENT_START.get(),dev.voxydistant.config.DistantConfig.MOVEMENT_MAXIMUM.get(),dev.voxydistant.config.DistantConfig.MOVEMENT_SECONDS.get());
-            dev.voxydistant.movement.MovementPrediction.CLIENT.sample(mc.level,player==null?0:player.getX(),player==null?0:player.getZ(),mc.isPaused()||mc.screen!=null&&mc.screen.isPauseScreen(),config);
+            dev.voxydistant.movement.MovementPrediction.CLIENT.capture(mc.level,player==null?0:player.getX(),player==null?0:player.getZ(),mc.isPaused()||mc.screen!=null&&mc.screen.isPauseScreen(),config);
             RemoteClient.tick(); GenerationController.clientTick();
         }
     }

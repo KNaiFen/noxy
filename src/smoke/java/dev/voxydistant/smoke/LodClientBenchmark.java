@@ -120,6 +120,12 @@ public final class LodClientBenchmark {
             }
         }
         if(mc.player!=null){state.addProperty("x",mc.player.getX());state.addProperty("y",mc.player.getY());state.addProperty("z",mc.player.getZ());state.addProperty("yaw",mc.player.getYRot());state.addProperty("pitch",mc.player.getXRot());}
+        if(Boolean.getBoolean("voxyDistant.cpuCheck")&&mc.level!=null){
+            int pigs=0,moving=0;
+            for(var entity:mc.level.entitiesForRendering())if(entity instanceof net.minecraft.world.entity.animal.Pig){pigs++;double dx=entity.getX()-entity.xo,dz=entity.getZ()-entity.zo;if(dx*dx+dz*dz>1e-6)moving++;}
+            state.addProperty("cpu_entity_count",pigs);state.addProperty("cpu_moving_entities",moving);
+            state.addProperty("cpu_vsync",mc.options.enableVsync().get());state.addProperty("cpu_max_fps",mc.options.framerateLimit().get());
+        }
         return state;
     }
     private void writeJson(Path path,JsonObject value)throws IOException{
@@ -139,12 +145,16 @@ public final class LodClientBenchmark {
     }
     private void tick(TickEvent.ClientTickEvent e) {
         if(e.phase!=TickEvent.Phase.END)return;
+        var mc=Minecraft.getInstance();
         if(cruiseRoute!=null&&cruiseSegment<cruiseRoute.size()){
+            if(Boolean.getBoolean("voxyDistant.cpuCheck")){cameraX=mc.player.getX();cameraZ=mc.player.getZ();}
             var point=cruiseRoute.get(cruiseSegment).getAsJsonArray();double x=point.get(0).getAsDouble()*16,z=point.get(1).getAsDouble()*16,dx=x-cameraX,dz=z-cameraZ,distance=Math.hypot(dx,dz),step=cruiseSpeed/20;
             if(distance<=step){cameraX=x;cameraZ=z;cruiseSegment++;}else{cameraX+=dx/distance*step;cameraZ+=dz/distance*step;}
+            if(Boolean.getBoolean("voxyDistant.cpuCheck")){var p=mc.player;p.move(net.minecraft.world.entity.MoverType.SELF,new net.minecraft.world.phys.Vec3(cameraX-p.getX(),0,cameraZ-p.getZ()));p.setDeltaMovement(net.minecraft.world.phys.Vec3.ZERO);p.connection.send(new net.minecraft.network.protocol.game.ServerboundMovePlayerPacket.Pos(p.getX(),p.getY(),p.getZ(),p.onGround()));}
         }
         if(Boolean.getBoolean("voxyDistant.fixedCamera")&&Minecraft.getInstance().player!=null){var p=Minecraft.getInstance().player;p.setPos(cameraX,180,cameraZ);p.setYRot(cameraYaw);p.setXRot(15);}
-        var mc=Minecraft.getInstance();long now=System.nanoTime();if(now-lastSample<1_000_000_000)return;lastSample=now;
+        if(Boolean.getBoolean("voxyDistant.cpuCheck")&&mc.screen instanceof net.minecraft.client.gui.screens.PauseScreen)mc.setScreen(null);
+        long now=System.nanoTime();if(now-lastSample<1_000_000_000)return;lastSample=now;
         try {
             // A Windows reader can deny replacement of an open file. Keep complete state records.
             TransportMetrics.sample();
@@ -181,6 +191,9 @@ public final class LodClientBenchmark {
                             voxySaving=(me.cortex.voxy.common.world.service.SectionSavingService)saving.get(instance);
                         }
                         else if(command.equals("receive")){if(mc.level==null||RemoteClient.greeting()==null)throw new IllegalStateException("World or LOD handshake not ready");recording=Boolean.getBoolean("voxyDistant.recordProcess");DistantConfig.RECEIVE.set(true);}
+                        else if(command.equals("receive-disable")){DistantConfig.RECEIVE.set(false);}
+                        else if(command.equals("prediction-toggle")){DistantConfig.MOVEMENT_PREDICTION.set(request.get("enabled").getAsBoolean());}
+                        else if(command.equals("cpu-view")){mc.options.pauseOnLostFocus=false;mc.options.enableVsync().set(false);mc.getWindow().updateVsync(false);mc.options.framerateLimit().set(260);mc.setScreen(null);mc.player.setYRot(0);mc.player.setXRot(15);}
                         else if(command.equals("disconnect")){if(mc.level==null)throw new IllegalStateException("Not in a world");mc.level.disconnect();mc.clearLevel();mc.setScreen(new TitleScreen());}
                         else if(command.equals("quit")){mc.stop();}
                         else if(command.equals("reload")){DistantConfig.reload();}
@@ -222,10 +235,11 @@ public final class LodClientBenchmark {
             if(session!=null) {
                 receiveLimit=(long)LodMetrics.field(session,"receiveLimit");snapshotLimit=(long)LodMetrics.field(session,"snapshotLimit");credit=(int)LodMetrics.field(session,"networkCapacity");
                 fullRetry=((Set<?>)LodMetrics.field(session,"fullRetry")).size();
-                retries=((dev.voxydistant.client.RetryQueue)LodMetrics.field(session,"retries")).size();
+                retries=Boolean.getBoolean("voxyDistant.cpuBaseline")?((dev.voxydistant.client.RetryQueue)LodMetrics.field(session,"retries")).size():(int)LodMetrics.field(session,"retryCount");
                 applied=(long)LodMetrics.field(session,"applied");received=(long)LodMetrics.field(session,"received");memory=((AtomicLong)LodMetrics.field(session,"memory")).get();pending=((Map<?,?>)LodMetrics.field(session,"pending")).size();
                 var worker=(ThreadPoolExecutor)LodMetrics.field(session,"worker");queue=worker.getQueue().size();active=worker.getActiveCount();
-                var discovery=LodMetrics.field(session,"discovery");var busy=discovery.getClass().getDeclaredMethod("busy");busy.setAccessible(true);scanning=(boolean)busy.invoke(discovery);invalid=((Set<?>)LodMetrics.field(session,"invalid")).size();
+                if(Boolean.getBoolean("voxyDistant.cpuBaseline")){var discovery=LodMetrics.field(session,"discovery");var busy=discovery.getClass().getDeclaredMethod("busy");busy.setAccessible(true);scanning=(boolean)busy.invoke(discovery);invalid=((Set<?>)LodMetrics.field(session,"invalid")).size();}
+                else{scanning=(boolean)LodMetrics.field(session,"scanning");invalid=(int)LodMetrics.field(session,"invalidCount");}
                 if(auditedLevels!=null){
                     int radius=(int)LodMetrics.field(session,"radius"),width=radius*2+1;
                     var engine=(me.cortex.voxy.common.world.WorldEngine)LodMetrics.field(session,"engine");
