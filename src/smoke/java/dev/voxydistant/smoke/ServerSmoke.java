@@ -102,6 +102,7 @@ public final class ServerSmoke {
                 // Keep incidental spawn refresh work from changing the foreground conversion counter.
                 var missing=(Set<?>)field(service,"missingChecks");missing.clear();
                 var dirty=(Map<?,?>)field(service,"dirty");dirty.clear();
+                if(Boolean.getBoolean("voxyDistant.serverHotspotCheck")){ServerHotspotCheck.run(server,service);stage=3;server.halt(false);return;}
                 priorityCheck();pumpCheck(service);fragmentSliceCheck();
                 var sessions=(Map<UUID,Object>)field(service,"players");var type=Class.forName("dev.voxydistant.server.RemoteServer$Session");var ctor=type.getDeclaredConstructor(ServerPlayer.class);ctor.setAccessible(true);
                 for(int i=0;i<2;i++){Peer p=new Peer(i);peers.add(p);sessions.put(p.player.getUUID(),ctor.newInstance(p.player));RemoteServer.requests(p.player,new Protocol.Requests(1,96,2,0,32<<20,List.of(new Protocol.Want(40,40,0,5))));}
@@ -367,7 +368,7 @@ public final class ServerSmoke {
             if(batchCase==4)check(batchPeer.batches.equals(List.of(3)),"incomplete tail sent");
             sessions.remove(batchPeer.player.getUUID());batchPeer=null;
         }
-        if(batchCase==5){batchLifecycleCheck(service);transferOrderCheck(service);dev.voxydistant.config.DistantConfig.PLAYER_SEND_MIB.set(32);dev.voxydistant.config.DistantConfig.TOTAL_MBPS.set(8.0);dev.voxydistant.config.DistantConfig.MAX_BATCH_COLUMNS.set(1);System.out.println("DISTANT_BATCH_PASS: 16/128, mixed levels, fragmentation, credit split, tail, repeated requests, stale/abort/epoch and exact budget release");return true;}
+        if(batchCase==5){batchLifecycleCheck(service);transferOrderCheck(service);cancelCheck(service);dev.voxydistant.config.DistantConfig.PLAYER_SEND_MIB.set(32);dev.voxydistant.config.DistantConfig.TOTAL_MBPS.set(8.0);dev.voxydistant.config.DistantConfig.MAX_BATCH_COLUMNS.set(1);System.out.println("DISTANT_BATCH_PASS: 16/128, mixed levels, fragmentation, credit split, tail, repeated requests, stale/abort/epoch and exact budget release");return true;}
         batchCase++;int max=batchCase==2?128:16;expectedBatchColumns=batchCase==2?128:batchCase==4?3:batchCase==5?1:16;
         dev.voxydistant.config.DistantConfig.MAX_BATCH_COLUMNS.set(max);dev.voxydistant.config.DistantConfig.COMPRESSION_LEVEL.set(1);dev.voxydistant.config.DistantConfig.TOTAL_MBPS.set(30.0);
         batchPeer=new Peer(30+batchCase);var type=Class.forName("dev.voxydistant.server.RemoteServer$Session");var ctor=type.getDeclaredConstructor(ServerPlayer.class);ctor.setAccessible(true);Object session=ctor.newInstance(batchPeer.player);sessions.put(batchPeer.player.getUUID(),session);
@@ -430,6 +431,7 @@ public final class ServerSmoke {
         var transfer=Class.forName("dev.voxydistant.server.RemoteServer$Transfer");var tc=transfer.getDeclaredConstructor(long.class,net.minecraft.resources.ResourceKey.class,int.class,List.class,ColumnCodec.Encoded.class);tc.setAccessible(true);
         var offset=transfer.getDeclaredField("offset");offset.setAccessible(true);
         var select=RemoteServer.class.getDeclaredMethod("selectTransfer",type);select.setAccessible(true);
+        var enqueue=RemoteServer.class.getDeclaredMethod("queueTransfer",type,transfer);enqueue.setAccessible(true);
         var send=(Deque<Object>)field(session,"send");var shapes=type.getDeclaredField("shape");shapes.setAccessible(true);var order=type.getDeclaredField("sendOrder");order.setAccessible(true);
         var aged=type.getDeclaredField("lastSendAgedTick");aged.setAccessible(true);
         var random=new Random(497);int tick=(int)field(service,"ticks");
@@ -441,7 +443,13 @@ public final class ServerSmoke {
                 var list=new ArrayList<Protocol.Member>();for(int m=0;m<8;m++)list.add(new Protocol.Member(random.nextInt(101)-50,random.nextInt(101)-50,1,m%5,i*8L+m+1,1));
                 Object t=tc.newInstance(i+1L,net.minecraft.world.level.Level.OVERWORLD,1,List.copyOf(list),new ColumnCodec.Encoded(false,1,new byte[]{0}));send.add(t);members.put(t,list);
             }
+            int selected=0;
             while(!send.isEmpty()){
+                if(selected==8){shape=new dev.voxydistant.movement.RequestShape(3,-2,3.5,-1.75,-Math.sin(angle),Math.cos(angle),1,256,256);shapes.set(session,shape);peer.player.setPos(48,100,-32);}
+                if(selected==16){
+                    var list=List.of(new Protocol.Member(0,0,1,0,9000,1));Object t=tc.newInstance(9000L,net.minecraft.world.level.Level.OVERWORLD,1,list,new ColumnCodec.Encoded(false,1,new byte[]{0}));
+                    enqueue.invoke(null,session,t);members.put(t,list);check(field(session,"sendOrder")==null,"new transfer invalidates cached insertion order");
+                }
                 boolean age=tick-aged.getInt(session)>=20;Object expected=send.getFirst();int bestX=0,bestZ=0;boolean found=false;
                 for(Object t:send){
                     if(age){if((long)field(t,"created")<(long)field(expected,"created"))expected=t;}
@@ -451,12 +459,61 @@ public final class ServerSmoke {
                         if(!found||shape.compare(x,z,bestX,bestZ)<0){found=true;bestX=x;bestZ=z;expected=t;}
                     }
                 }
+                Object cached=field(session,"sendOrder");
                 select.invoke(service,session);check(send.getFirst()==expected,"transfer heap matches exhaustive aging/directional priority");
-                offset.setInt(expected,1);select.invoke(service,session);check(send.getFirst()==expected,"partial transfer stays at head");send.removeFirst();
+                if(cached!=null&&selected!=8&&selected!=16&&send.size()>1)check(field(session,"sendOrder")==cached,"unchanged score inputs reuse transfer heap across selections");
+                var heap=(java.util.PriorityQueue<Object>)field(session,"sendOrder");if(heap!=null)heap.remove(expected);
+                offset.setInt(expected,1);select.invoke(service,session);check(send.getFirst()==expected,"partial transfer stays at head");send.removeFirst();selected++;
             }
+            peer.player.setPos(0,100,0);
         }
         sessions.remove(peer.player.getUUID());
-        System.out.println("DISTANT_TRANSFER_ORDER_PASS: exhaustive mixed-member order, prediction, aging and partial continuity");
+        System.out.println("DISTANT_TRANSFER_ORDER_PASS: cached order, movement/turn rebuild, arrivals, aging and partial continuity");
+    }
+    @SuppressWarnings("unchecked") private void cancelCheck(Object service)throws ReflectiveOperationException{
+        var sessions=(Map<UUID,Object>)field(service,"players");var peer=new Peer(82);
+        var type=Class.forName("dev.voxydistant.server.RemoteServer$Session");var sc=type.getDeclaredConstructor(ServerPlayer.class);sc.setAccessible(true);Object s=sc.newInstance(peer.player);sessions.put(peer.player.getUUID(),s);
+        RemoteServer.requests(peer.player,new Protocol.Requests(1,256,2,0,120<<20,List.of()));
+        var transfer=Class.forName("dev.voxydistant.server.RemoteServer$Transfer");var tc=transfer.getDeclaredConstructor(long.class,net.minecraft.resources.ResourceKey.class,int.class,List.class,ColumnCodec.Encoded.class);tc.setAccessible(true);
+        var single=transfer.getDeclaredConstructor(long.class,RemoteServer.Key.class,int.class,long.class,int.class,long.class,ColumnCodec.Encoded.class);single.setAccessible(true);
+        var creditType=Class.forName("dev.voxydistant.server.RemoteServer$Credit");var cc=creditType.getDeclaredConstructors()[0];cc.setAccessible(true);
+        var enqueue=RemoteServer.class.getDeclaredMethod("queueTransfer",type,transfer);enqueue.setAccessible(true);
+        var select=RemoteServer.class.getDeclaredMethod("selectTransfer",type);select.setAccessible(true);
+        var offset=transfer.getDeclaredField("offset");offset.setAccessible(true);
+        var send=(Deque<Object>)field(s,"send");var inflight=(Map<Long,Object>)field(s,"inflight");
+        var pending=(Map<Long,Protocol.Want>)field(s,"pending");var latest=(Map<Long,Long>)field(s,"latestRequestIds");
+        var payload=new ColumnCodec.Encoded(false,1024,new byte[1024]);int sections=peer.player.level().getSectionsCount();
+        var a=new Protocol.Member(40,40,1,2,501,1);var b=new Protocol.Member(41,40,1,2,502,1);
+        var c=new Protocol.Member(42,40,1,2,503,1);var d=new Protocol.Member(43,40,1,2,504,1);var e=new Protocol.Member(44,40,1,2,505,1);
+        Object queued=tc.newInstance(91001L,net.minecraft.world.level.Level.OVERWORLD,1,List.of(a,b),payload);
+        Object partial=tc.newInstance(91002L,net.minecraft.world.level.Level.OVERWORLD,1,List.of(c,d),payload);
+        Object keep=tc.newInstance(91003L,net.minecraft.world.level.Level.OVERWORLD,1,List.of(d,e),payload);
+        Object newer=single.newInstance(91004L,new RemoteServer.Key(net.minecraft.world.level.Level.OVERWORLD,40,40),2,1L,1,601L,payload);
+        Object aborted=single.newInstance(91005L,new RemoteServer.Key(net.minecraft.world.level.Level.OVERWORLD,45,40),2,1L,1,506L,payload);
+        for(Object t:List.of(queued,partial,keep,newer,aborted))enqueue.invoke(null,s,t);
+        offset.setInt(partial,1);offset.setInt(keep,1);offset.setInt(aborted,1);
+        long held=Protocol.batchReservation(1024,1024,List.of(a,b),sections),reserved=0;
+        for(Object t:List.of(partial,keep,aborted)){long id=(long)field(t,"id");var reservation=transfer.getDeclaredMethod("reservation",int.class);reservation.setAccessible(true);long charge=(long)reservation.invoke(t,sections);inflight.put(id,cc.newInstance(charge,System.nanoTime(),t));reserved+=charge;}
+        var bytes=type.getDeclaredField("bytes");bytes.setAccessible(true);bytes.setLong(s,5*1024);
+        var bc=type.getDeclaredField("batchCredit");bc.setAccessible(true);bc.setLong(s,held);
+        var reservedField=type.getDeclaredField("reserved");reservedField.setAccessible(true);reservedField.setLong(s,reserved);
+        long pos=net.minecraft.world.level.ChunkPos.asLong(40,40);pending.put(pos,new Protocol.Want(40,40,1,2,601));latest.put(pos,601L);
+        var encoding=type.getDeclaredField("encodingMembers");encoding.setAccessible(true);encoding.set(s,List.of(a,b));
+        var aged=type.getDeclaredField("lastSendAgedTick");aged.setAccessible(true);aged.setInt(s,(int)field(service,"ticks"));select.invoke(service,s);
+        RemoteServer.requests(peer.player,new Protocol.Requests(1,256,2,0,120<<20,List.of(),List.of(new Protocol.Cancel(40,40,500),new Protocol.Cancel(40,40,501),new Protocol.Cancel(41,40,502),new Protocol.Cancel(42,40,503),new Protocol.Cancel(43,40,504),new Protocol.Cancel(45,40,506))));
+        check(send.size()==2&&send.contains(keep)&&send.contains(newer),"packet cancellation drops fully cancelled batches and preserves newer requests");
+        check(pending.get(pos).requestId()==601&&latest.get(pos)==601,"old cancellation cannot remove newer pending request");
+        check((long)field(s,"bytes")==2048&&(long)field(s,"batchCredit")==0,"cancelled queued payload releases memory and batch credit once");
+        check(peer.aborts==2&&(long)field(s,"reserved")==reserved,"inflight cancellation sends abort and waits for receipt");
+        check(((Set<?>)field(inflight.get(91003L),"cancelled")).equals(Set.of(d)),"partially cancelled inflight batch preserves other member");
+        check(((Set<?>)field(s,"encodingCancelled")).equals(Set.of(a,b)),"one cancellation packet covers encoding members");
+        check(field(s,"sendOrder")==null,"cancelled queue invalidates cached transfer order");
+        RemoteServer.receipt(peer.player,new Protocol.Receipt(1,91002L));RemoteServer.receipt(peer.player,new Protocol.Receipt(1,91005L));long remaining=(long)field(s,"reserved");
+        RemoteServer.receipt(peer.player,new Protocol.Receipt(1,91002L));check((long)field(s,"reserved")==remaining&&inflight.size()==1,"duplicate abort receipt cannot double release");
+        RemoteServer.requests(peer.player,new Protocol.Requests(1,256,2,0,120<<20,List.of(),List.of(new Protocol.Cancel(44,40,505))));check(peer.aborts==3&&send.size()==1,"later cancellation completes previously partial batch");
+        RemoteServer.receipt(peer.player,new Protocol.Receipt(1,91003L));check((long)field(s,"reserved")==0,"all abort receipts release exact credit");
+        RemoteServer.requests(peer.player,new Protocol.Requests(2,256,2,0,120<<20,List.of()));check(send.isEmpty()&&field(s,"sendOrder")==null,"epoch clears cached order and payload");
+        sessions.remove(peer.player.getUUID());System.out.println("DISTANT_CANCEL_PASS: packet cancellations, duplicate positions, request IDs, encoding, partial/all aborts and exact credit");
     }
     @SuppressWarnings("unchecked") private void benchmark(Object service)throws ReflectiveOperationException{
         benchmark=true;var sessions=(Map<UUID,Object>)field(service,"players");var sessionType=Class.forName("dev.voxydistant.server.RemoteServer$Session");var sessionCtor=sessionType.getDeclaredConstructor(ServerPlayer.class);sessionCtor.setAccessible(true);

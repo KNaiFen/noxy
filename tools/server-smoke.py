@@ -17,6 +17,7 @@ import tomllib
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument('--diagnostics', action='store_true', help='Enable production diagnostics and verify transfer/database log events')
+parser.add_argument('--hotspots', action='store_true', help='Measure production chooser/cancellation with synthetic queues')
 parser.add_argument('--config-language', choices=['zh_cn', 'en_us'], default='zh_cn', help='Verify upgraded config comments in this language')
 options = parser.parse_args()
 run = root / 'build' / f'integration-{time.time_ns()}'
@@ -33,6 +34,8 @@ env['MOD_CLASSES'] = launch['mod_classes'] + ';distant_smoke%%' + str(root / 'bu
 args = [arg for arg in launch['args'] if not arg.startswith('-Dfml.modFolders=')]
 args.insert(1, '-Dfml.modFolders=' + env['MOD_CLASSES'])
 args.insert(1, '-Dfile.encoding=UTF-8')
+if options.hotspots:
+    args.insert(1, '-DvoxyDistant.serverHotspotCheck=true')
 process = subprocess.Popen(args, cwd=run, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
 lines = queue.Queue()
@@ -55,9 +58,11 @@ with (root / 'logs/integration-check.log').open('w', encoding='utf-8') as log:
         if line:
             log.write(line)
             log.flush()
-            if 'DISTANT_SMOKE_' in line or 'DISTANT_MAINTENANCE_' in line or 'Exception' in line or 'Error' in line:
+            if 'DISTANT_SMOKE_' in line or 'DISTANT_MAINTENANCE_' in line or 'SERVER_HOTSPOT' in line or 'Exception' in line or 'Error' in line:
                 print(line, end='')
             passed |= 'DISTANT_SMOKE_PASS' in line
+            if options.hotspots and 'DISTANT_SERVER_HOTSPOT_PASS' in line:
+                passed = maintenance_stopped = True
             maintenance_stopped |= 'DISTANT_MAINTENANCE_STOP_PASS' in line
         if time.monotonic() > deadline:
             process.stdin.write('voxydistant stats\nstop\n')
@@ -73,7 +78,7 @@ with (root / 'logs/integration-check.log').open('w', encoding='utf-8') as log:
         log.write(line)
         maintenance_stopped |= 'DISTANT_MAINTENANCE_STOP_PASS' in line
 print('INTEGRATION_PASS', passed and maintenance_stopped, 'EXIT', result)
-if options.diagnostics:
+if options.diagnostics and not options.hotspots:
     content = (root / 'logs/integration-check.log').read_text(encoding='utf-8')
     required = ['SERVER cache ', 'SERVER send_begin ', 'SERVER submitted ', 'SERVER receipt ',
                 'SERVER player_interval ', 'SERVER encoded ', 'DATABASE interval ',
