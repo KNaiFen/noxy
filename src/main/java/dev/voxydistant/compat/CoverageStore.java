@@ -130,16 +130,19 @@ public final class CoverageStore {
     }
     public synchronized int limitShape(dev.voxydistant.movement.RequestShape shape,int renderRadius){
         int available=Math.max(1,maxPages-Math.max(16,maxPages/20));
+        if(shapeFits(shape,renderRadius,available))return shape.radius();
         int low=0,high=shape.radius();
-        while(low<high){int mid=(low+high+1)/2;var footprint=shape.radius(mid);var ids=new HashSet<Long>();
-            int reach=Math.max(renderRadius,(int)Math.ceil(Math.hypot(shape.centerX()-shape.playerX(),shape.centerZ()-shape.playerZ())+mid*(1+.5*shape.amount())));
-            for(int rz=Math.floorDiv(shape.playerZ()-reach,32);rz<=Math.floorDiv(shape.playerZ()+reach,32);rz++)for(int rx=Math.floorDiv(shape.playerX()-reach,32);rx<=Math.floorDiv(shape.playerX()+reach,32);rx++){
-                int x=rx*32,z=rz*32;long dx=Math.max(Math.max((long)x-shape.playerX(),shape.playerX()-(x+31L)),0),dz=Math.max(Math.max((long)z-shape.playerZ(),shape.playerZ()-(z+31L)),0);
-                if(dx*dx+dz*dz<=(long)renderRadius*renderRadius||footprint.relation(x,z,x+31,z+31)>=0)for(int py=Math.floorDiv(minY,32);py<=Math.floorDiv(maxY-1,32);py++)ids.add(node(4,rx,py,rz));
-            }
-            ids.addAll(changedPages);if(ids.size()<=available)low=mid;else high=mid-1;
-        }
+        while(low<high){int mid=(low+high+1)/2;if(shapeFits(shape.radius(mid),renderRadius,available))low=mid;else high=mid-1;}
         return low;
+    }
+    private boolean shapeFits(dev.voxydistant.movement.RequestShape shape,int renderRadius,int available){
+        int count=changedPages.size();
+        int reach=Math.max(renderRadius,(int)Math.ceil(Math.hypot(shape.centerX()-shape.playerX(),shape.centerZ()-shape.playerZ())+shape.radius()*(1+.5*shape.amount())));
+        for(int rz=Math.floorDiv(shape.playerZ()-reach,32);rz<=Math.floorDiv(shape.playerZ()+reach,32);rz++)for(int rx=Math.floorDiv(shape.playerX()-reach,32);rx<=Math.floorDiv(shape.playerX()+reach,32);rx++){
+            int x=rx*32,z=rz*32;long dx=Math.max(Math.max((long)x-shape.playerX(),shape.playerX()-(x+31L)),0),dz=Math.max(Math.max((long)z-shape.playerZ(),shape.playerZ()-(z+31L)),0);
+            if(dx*dx+dz*dz<=(long)renderRadius*renderRadius||shape.relation(x,z,x+31,z+31)>=0)for(int py=Math.floorDiv(minY,32);py<=Math.floorDiv(maxY-1,32);py++)if(!changedPages.contains(node(4,rx,py,rz))&&++count>available)return false;
+        }
+        return count<=available;
     }
     private int pinnedOutside(int radius,int x,int z){
         int count=0;long squared=(long)radius*radius;

@@ -26,7 +26,7 @@ public record DistanceBands(int[] radii, int[] levels) {
         for (int i = 0; i < radii.length; i++) {
             // Parent of the requested level covers 2^(level+2) vanilla chunks.
             int size = 1 << (levels[i] + 2);
-            int bx = Math.floorDiv(x, size) * size, bz = Math.floorDiv(z, size) * size;
+            int bx = x & -size, bz = z & -size;
             long dx = Math.max(Math.max(bx - playerX, playerX - (bx + size - 1)), 0);
             long dz = Math.max(Math.max(bz - playerZ, playerZ - (bz + size - 1)), 0);
             if (dx * dx + dz * dz <= (long) radii[i] * radii[i]) return levels[i];

@@ -38,6 +38,23 @@ class RegionDiscoveryTest {
             }
         }
     }
+    @Test void convexRowQueueMatchesExhaustiveRequestOrder()throws Exception{
+        var bands=DistanceBands.parse(List.of("4:0","16:1","32:2"));
+        var constructor=CoverageStore.Directory.class.getDeclaredConstructor(int.class,int.class);constructor.setAccessible(true);
+        for(int heading=0;heading<12;heading++){
+            double angle=heading*Math.PI/6;
+            var shape=new dev.voxydistant.movement.RequestShape(-3,-9,-2.3125,-8.6875,Math.cos(angle),Math.sin(angle),.75,32,64);
+            var scan=new RegionDiscovery(bands);scan.move(shape);
+            for(var r:scan.regions.values()){scan.applyMasks(r,shape,scan.buildMasks(r,shape));scan.local(r,constructor.newInstance(-4,20));}
+            java.util.Comparator<Long> order=(a,b)->shape.compare(RegionDiscovery.x(a),RegionDiscovery.z(a),RegionDiscovery.x(b),RegionDiscovery.z(b));
+            var near=new java.util.TreeSet<Long>(order);var far=new java.util.TreeSet<Long>(order);
+            for(int z=shape.minZ();z<=shape.maxZ();z++)for(int x=shape.minX();x<=shape.maxX();x++)if(shape.contains(x,z))(shape.desired(bands,x,z)==0?near:far).add(RegionDiscovery.key(x,z));
+            for(int i=0;i<512;i++){
+                var queue=(i&3)==3?far:near;if(queue.isEmpty())queue=(i&3)==3?near:far;
+                assertEquals(queue.pollFirst(),scan.poll(),"heading="+heading+" request="+i);
+            }
+        }
+    }
     @TempDir Path path;
     @Test void movementMatchesExactDistanceBandsAndDoesNotRecheckInterior(){
         var bands=DistanceBands.parse(List.of("32:0","64:1","96:2"));
@@ -56,9 +73,9 @@ class RegionDiscoveryTest {
         for(var r:scan.regions.values())scan.local(r,cache.directory(r.x,r.z,false));
         int near=0,far=0;for(int i=0;i<64;i++){long p=scan.poll();if(bands.select(RegionDiscovery.x(p),RegionDiscovery.z(p),0,0)==0)near++;else far++;}
         assertEquals(48,near);assertEquals(16,far);
-        for(var r:scan.regions.values()){r.urgent.clear();r.nearCursor=r.farCursor=0;}
+        for(var r:scan.regions.values()){r.urgent.clear();r.orderedFor=null;}
         for(int i=0;i<64;i++)assertNotNull(scan.poll(),"far queue borrows all empty near quota");
-        for(var r:scan.regions.values()){r.urgent.or(r.needs);r.nearCursor=r.farCursor=0;}
+        for(var r:scan.regions.values()){r.urgent.or(r.needs);r.orderedFor=null;}
         for(int i=0;i<64;i++)assertNotNull(scan.poll(),"near queue borrows all empty far quota");
         var region=scan.regions.get(RegionDiscovery.key(1,0));long pos=RegionDiscovery.key(40,0);scan.updated(pos,new CoverageStore.Stamp(10,1));
         long[] versions=new long[1024];byte[] masks=new byte[1024];java.util.Arrays.fill(versions,11);java.util.Arrays.fill(masks,(byte)31);
