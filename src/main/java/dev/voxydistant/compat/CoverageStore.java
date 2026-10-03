@@ -30,7 +30,6 @@ public final class CoverageStore {
         path=path.toAbsolutePath().normalize();var handle=databases.get(path);
         if(--handle.references==0){databases.remove(path);handle.database.join().close();}
     }
-    private static final byte[] DIRECTORY_PROGRESS="coverage-directory-progress-v2".getBytes(java.nio.charset.StandardCharsets.UTF_8);
     private volatile it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<Page> pages = new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();
     private final LinkedHashMap<Long, Page> lru = new LinkedHashMap<>(16,.75f,true);
     private final LinkedHashMap<Long,Directory> directories=new LinkedHashMap<>(16,.75f,true);
@@ -403,32 +402,82 @@ public final class CoverageStore {
     private static byte[] encode(Page p){var b=ByteBuffer.allocate(1+32768*9).put((byte)(p.restricted?1:0));for(int i=0;i<32768;i++)b.put(p.minimum[i]).putLong(p.versions[i]);return b.array();}
     public synchronized void saveAfterWorldClosed(){var db=database.join();var batch=new HashMap<byte[],byte[]>();for(var e:lru.entrySet()){var pending=pendingSaves.get(e.getKey());if(pending!=null&&!pending.isEmpty()){if(DebugLog.enabled())for(long node:pending)DebugLog.log("CLIENT close_unconfirmed page={} node={} current_generation={}",e.getKey(),node,meshGeneration(node));continue;}byte[] raw=encode(e.getValue());batch.put(key(e.getKey()),raw);batch.put(directoryKey(e.getKey()),Directory.fromCoverage(raw,ny(e.getKey())*32).encode());batch.put(guard(e.getKey()),new byte[]{0});if(batch.size()>=32){db.batch(batch);batch.clear();}}if(!batch.isEmpty())db.batch(batch);closeDatabase(path.resolveSibling(path.getFileName()+".rocksdb"));pages=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();lru.clear();directories.clear();}
     public synchronized void closeUnconfirmed(){closeDatabase(path.resolveSibling(path.getFileName()+".rocksdb"));pages=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();lru.clear();directories.clear();}
-    public record DirectoryProgress(long pages,boolean complete){}
-    public static boolean directoriesComplete(LodDatabase db){byte[] progress=db.get(DIRECTORY_PROGRESS);return progress!=null&&progress[0]!=0;}
-    public static DirectoryProgress rebuildDirectoriesStep(LodDatabase db){return rebuildDirectoriesStep(db,null);}
-    public static DirectoryProgress rebuildDirectoriesStep(LodDatabase db,ExecutorService readers){
-        LodDatabase.KeyPage next;
-        synchronized(db){
-            byte[] progress=db.get(DIRECTORY_PROGRESS);long pages=progress==null?0:ByteBuffer.wrap(progress,1,8).getLong();
-            if(progress!=null&&progress[0]!=0)return new DirectoryProgress(pages,true);
-            byte[] after=progress==null?null:Arrays.copyOfRange(progress,9,progress.length);next=db.keys(1,after,readers==null?1:6);
-        }
-        var results=new ArrayList<CompletableFuture<byte[]>>();
-        for(byte[] k:next.keys()){
-            java.util.function.Supplier<byte[]> read=()->{long id=ByteBuffer.wrap(k,1,8).getLong();byte[] existing=db.get(directoryKey(id));return existing==null||ByteBuffer.wrap(existing).getInt()!=Directory.FORMAT?Directory.fromCoverage(db.get(k),ny(id)*32).encode():null;};
-            results.add(readers==null?CompletableFuture.completedFuture(read.get()):CompletableFuture.supplyAsync(read,readers));
-        }
-        CompletableFuture.allOf(results.toArray(CompletableFuture[]::new)).join();
-        synchronized(db){
-            byte[] progress=db.get(DIRECTORY_PROGRESS);long pages=progress==null?0:ByteBuffer.wrap(progress,1,8).getLong();byte[] after=progress==null?null:Arrays.copyOfRange(progress,9,progress.length);
-            var batch=new HashMap<byte[],byte[]>();
-            for(int i=0;i<next.keys().size();i++){
-                byte[] k=next.keys().get(i),directoryKey=directoryKey(ByteBuffer.wrap(k,1,8).getLong()),value=results.get(i).join();
-                if(value!=null){byte[] current=db.get(directoryKey);if(current==null||ByteBuffer.wrap(current).getInt()!=Directory.FORMAT)batch.put(directoryKey,value);}
-                after=k;pages++;
+    public record RebuildProgress(long sections,long pages){}
+    /** Explicit worker-only pass over actual Voxy storage, independent of old completion markers. */
+    public RebuildProgress rebuildIndex(me.cortex.voxy.common.world.WorldEngine world,java.util.function.BooleanSupplier cancelled,java.util.function.Consumer<RebuildProgress> progress){
+        var db=database.join();var found=new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<it.unimi.dsi.fastutil.longs.LongArrayList>();long reported=System.nanoTime();
+        world.storage.iteratePositions(-1,node->{
+            if(cancelled.getAsBoolean())throw new CancellationException();
+            int level=(int)(node>>>60);if(level>4)return;
+            long id=pageKey(nx(node)<<(level+1),ny(node)<<(level+1),nz(node)<<(level+1));
+            found.computeIfAbsent(id,k->new it.unimi.dsi.fastutil.longs.LongArrayList()).add(node);
+        });
+        // Include coverage-only AIR pages and replace even an existing but incorrect directory.
+        byte[] after=null;
+        do{
+            if(cancelled.getAsBoolean())throw new CancellationException();
+            var batch=db.keys(1,after,64);
+            for(byte[] key:batch.keys()){found.putIfAbsent(ByteBuffer.wrap(key,1,8).getLong(),null);after=key;}
+            if(batch.exhausted())break;
+        }while(true);
+        long rebuilt=0,loadedSections=0;
+        var entries=found.long2ObjectEntrySet().iterator();
+        while(entries.hasNext()){
+            if(cancelled.getAsBoolean())throw new CancellationException();
+            var entry=entries.next();byte[] minimum=null;var nodes=entry.getValue();
+            if(nodes!=null){
+                minimum=new byte[32768];Arrays.fill(minimum,(byte)5);
+                for(int n=0;n<nodes.size();n++){
+                    if(cancelled.getAsBoolean())throw new CancellationException();
+                    long node=nodes.getLong(n);int level=(int)(node>>>60);
+                    var section=me.cortex.voxy.common.world.WorldSection._createRawUntrackedUnsafeSection(level,nx(node),ny(node),nz(node));section.acquire();
+                    try{
+                        int loaded=world.storage.loadSection(section);
+                        if(loaded<0)throw new IllegalStateException("无法读取 Voxy LOD："+me.cortex.voxy.common.world.WorldEngine.pprintPos(node));
+                        if(loaded!=0)continue;
+                        int x=nx(node)<<(level+1),y=ny(node)<<(level+1),z=nz(node)<<(level+1);
+                        // Voxy has no mask for ingested AIR. Only an octant with geometry proves coverage.
+                        long[] data=section._unsafeGetRawDataArray();
+                        for(int bit=0;bit<8;bit++){
+                            int base=((bit&1)<<4)|((bit&2)<<8)|((bit&4)<<12);boolean occupied=false;
+                            for(int by=0;by<16&&!occupied;by++)for(int bz=0;bz<16&&!occupied;bz++)for(int bx=0;bx<16;bx++)if(!me.cortex.voxy.common.world.other.Mapper.isAir(data[base+(by<<10)+(bz<<5)+bx])){occupied=true;break;}
+                            if(!occupied)continue;
+                            int cx=x+((bit&1)<<level),cy=y+(((bit>>2)&1)<<level),cz=z+(((bit>>1)&1)<<level),span=1<<level;
+                            for(int sy=cy;sy<cy+span;sy++)for(int sz=cz;sz<cz+span;sz++)for(int sx=cx;sx<cx+span;sx++){int i=index(sx,sy,sz);minimum[i]=(byte)Math.min(minimum[i],level);}
+                        }
+                        loadedSections++;
+                    }finally{section.release();}
+                    long now=System.nanoTime();if(now-reported>=TimeUnit.SECONDS.toNanos(5)){reported=now;progress.accept(new RebuildProgress(loadedSections,rebuilt));}
+                }
             }
-            batch.put(DIRECTORY_PROGRESS,ByteBuffer.allocate(9+(after==null?0:after.length)).put((byte)(next.exhausted()?1:0)).putLong(pages).put(after==null?new byte[0]:after).array());db.batch(batch);
-            if(next.exhausted())db.sync();return new DirectoryProgress(pages,next.exhausted());
+            if(cancelled.getAsBoolean())throw new CancellationException();
+            rebuildPage(entry.getLongKey(),minimum);rebuilt++;entries.remove();
+            long now=System.nanoTime();if(now-reported>=TimeUnit.SECONDS.toNanos(5)){reported=now;progress.accept(new RebuildProgress(loadedSections,rebuilt));}
+        }
+        if(cancelled.getAsBoolean())throw new CancellationException();
+        db.sync();return new RebuildProgress(loadedSections,rebuilt);
+    }
+    private synchronized void rebuildPage(long id,byte[] minimum){
+        // Merge each page with the latest live data. Never clear unconfirmed writes or their guard.
+        var db=database.join();Page live=lru.get(id);byte[] unsafe=db.get(guard(id));
+        boolean guarded=changedPages.contains(id)||unsafe!=null&&unsafe[0]!=0;
+        byte[] raw=live==null?db.get(key(id)):encode(live);
+        if(raw==null){raw=new byte[1+32768*9];for(int i=0;i<32768;i++)raw[1+i*9]=5;}
+        boolean changed=false;
+        if(!guarded&&minimum!=null){
+            raw[0]=1; // Missing coarse children must keep their stored parent visible.
+            for(int i=0;i<32768;i++)if((raw[1+i*9]&255)==5&&minimum[i]<5){raw[1+i*9]=(byte)(minimum[i]|REFRESH_PENDING);changed=true;if(live!=null&&(ny(id)*32+(i>>10)>=minY&&ny(id)*32+(i>>10)<maxY))set(live,i&31,i>>10,(i>>5)&31,minimum[i]|REFRESH_PENDING,live.versions[i]);}
+        }
+        if(live!=null&&minimum!=null&&!guarded){live.restricted=true;live.renderMasks.clear();}
+        var batch=new HashMap<byte[],byte[]>();
+        if(!guarded)batch.put(key(id),raw);
+        batch.put(directoryKey(id),Directory.fromCoverage(raw,ny(id)*32).encode());db.batch(batch);directories.remove(id);
+        if(live!=null){live.directory=null;live.directoryDirty.set(0,1024);}
+        if(changed)revision++;
+        if(changed&&live!=null){
+            // Reject meshes built before the recovered coarse restrictions were known.
+            long generation=++meshSequence<<1;
+            for(int i=0;i<live.meshes.length();i++)live.meshes.set(i,generation);
         }
     }
     private static void migrate(Path path,LodDatabase db) {

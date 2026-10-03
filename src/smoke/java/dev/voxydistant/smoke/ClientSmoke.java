@@ -55,7 +55,7 @@ public final class ClientSmoke {
         CoarseLodReceiver.receive(engine,column(11,2,0),registries);check(index.column(-1,-1,0,1).equals(new CoverageStore.Stamp(11,2)),"new coarse replaces stale fine");
         var coarse=engine.acquire(2,-1,0,-1);try{for(long value:coarse._unsafeGetRawDataArray())check(Mapper.isAir(value),"explicit new air clears parent");}finally{coarse.release();}
         var fine=engine.acquire(0,-1,0,-1);try{check(Arrays.stream(fine._unsafeGetRawDataArray()).anyMatch(v->!Mapper.isAir(v)),"stale L0 remains stored");}finally{fine.release();}
-        compareMipper(engine.getMapper());checkNodeSwitch();checkCachedMesh(engine);index.closeUnconfirmed();
+        compareMipper(engine.getMapper());checkNodeSwitch();checkCachedMesh(engine);checkIndexRebuild();index.closeUnconfirmed();
         System.out.println("DISTANT_CLIENT_INGEST_PASS: actual Voxy sparse L4/L3/L2/L1/L0, stale rejection, coarse replacement, retained L0, 10000 mipper comparisons");
     }
     private static void checkNodeSwitch()throws Exception{
@@ -150,6 +150,67 @@ public final class ClientSmoke {
             check(reopened.meshGeneration(fine.key)>0,"later voxel writes still advance mesh generations");
         }finally{factory.free();fine.release();coarse.release();reopened.closeUnconfirmed();((EngineAccess)engine).distant$setCoverage(original);}
         System.out.println("DISTANT_CACHED_MESH_PASS: reopened disk coverage restored by transformed mesh hook before first mesh, with no network or movement");
+    }
+    private static void checkIndexRebuild()throws Exception{
+        var backend=new me.cortex.voxy.common.config.storage.rocksdb.RocksDBStorageBackend(Files.createTempDirectory("distant-rebuild-voxy").toString());
+        var storage=new me.cortex.voxy.common.config.section.SectionSerializationStorage(backend);
+        var world=new WorldEngine(storage);int stone=world.getMapper().getIdForBlockState(Blocks.STONE.defaultBlockState());
+        // Real serialized Voxy LOD, initially with no VoxyDistant coverage at all.
+        for(int level=0;level<=4;level++){
+            var section=WorldSection._createRawUntrackedUnsafeSection(level,0,0,0);section.acquire();
+            try{Arrays.fill(section._unsafeGetRawDataArray(),Mapper.AIR);section._unsafeGetRawDataArray()[0]=Mapper.composeMappingId((byte)0,stone,0);section._unsafeSetNonEmptyChildren((byte)1);if(level==0)section.addNonEmptyBlockCount(1);storage.saveSection(section);}finally{section.release();}
+        }
+        var empty=WorldSection._createRawUntrackedUnsafeSection(0,-17,-1,-17);empty.acquire();try{Arrays.fill(empty._unsafeGetRawDataArray(),Mapper.AIR);storage.saveSection(empty);}finally{empty.release();}storage.flush();
+        var path=Files.createTempDirectory("distant-rebuild-index").resolve("coverage.bin");var index=new CoverageStore(path);index.remote(-4,32,64);((EngineAccess)world).distant$setCoverage(index);
+        var database=CoverageStore.openDatabase(path.resolveSibling("coverage.bin.rocksdb")).join();
+        // Reproduce the false-ready marker from the deleted startup check.
+        database.put("coverage-directory-progress-v2".getBytes(java.nio.charset.StandardCharsets.UTF_8),ByteBuffer.allocate(9).put((byte)1).putLong(0).array());
+        CoverageStore.closeDatabase(path.resolveSibling("coverage.bin.rocksdb"));
+        check(index.column(0,0,0,1).level()==5,"before rebuild real Voxy data has no coverage");
+        var result=index.rebuildIndex(world,()->false,p->{});
+        check(result.sections()==6&&result.pages()==2,"rebuild enumerates actual Voxy storage even with old ready marker");
+        check(index.meshGeneration(CoverageStore.node(1,0,0,0))>0,"rebuild rejects a mesh built before recovered coarse restrictions");
+        check(!index.canSplit(CoverageStore.node(1,0,0,0)),"coarse-only neighbors keep parent subdivision blocked");
+        check(index.column(0,0,0,1).equals(new CoverageStore.Stamp(0,5)),"recovered geometry does not invent a confirmed server version");
+        check(!index.hasFull(0,0,0),"geometry recovery alone cannot certify a complete section");
+        index.saveAfterWorldClosed();
+        try(var options=new org.rocksdb.Options();var raw=org.rocksdb.RocksDB.open(options,path.resolveSibling("coverage.bin.rocksdb").toString())){
+            byte[] page=raw.get(ByteBuffer.allocate(9).put((byte)1).putLong(CoverageStore.node(4,0,0,0)).array());
+            check(page[1]==16,"L0 geometry precision recovered with pending validation");
+            check(page[1+8*9]==20,"coarse L4 geometry precision recovered with pending validation");
+            check(page[1+16*9]==5,"unobserved AIR octant remains unknown");
+        }
+        index=new CoverageStore(path);index.remote(-4,32,64);((EngineAccess)world).distant$setCoverage(index);
+        for(int y=0;y<2;y++)index.received(0,y,0,12,2,true);
+        index.restrict(0,0,0,2,13);index.received(0,0,0,13,1,false);
+        check(index.rebuildIndex(world,()->false,p->{}).sections()==6,"second force pass scans data again");
+        check(index.column(0,0,0,1).equals(new CoverageStore.Stamp(13,1)),"confirmed current detail survives merge");
+        check(index.column(0,0,1,2).equals(new CoverageStore.Stamp(13,5)),"pending refresh survives merge");
+        index.closeUnconfirmed();
+        index=new CoverageStore(path);index.remote(-4,32,64);((EngineAccess)world).distant$setCoverage(index);
+        index.rebuildIndex(world,()->false,p->{});check(index.directory(0,0,false).column(0).level()==5,"unsafe guard survives force rebuild and reopen");
+        // Concurrent ingest during the storage scan must win when the page is merged.
+        final CoverageStore current=index;boolean[] saved={false};
+        var concurrentStorage=new SectionStorage(){
+            public int loadSection(WorldSection section){return storage.loadSection(section);}
+            public void saveSection(WorldSection section){storage.saveSection(section);}
+            public void putIdMapping(int id,ByteBuffer bytes){storage.putIdMapping(id,bytes);}
+            public it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<byte[]> getIdMappingsData(){return storage.getIdMappingsData();}
+            public void flush(){storage.flush();}public void close(){}
+            public void iteratePositions(int level,java.util.function.LongConsumer callback){storage.iteratePositions(level,key->{callback.accept(key);if(!saved[0]){saved[0]=true;current.beginWrite(0,0,0,1);current.received(0,0,0,99,0,false);current.checkpoint(storage::flush);}});}
+        };
+        var concurrent=new WorldEngine(concurrentStorage);
+        try{index.rebuildIndex(concurrent,()->false,p->{});}finally{concurrent.free();}
+        check(index.column(0,0,0,1).equals(new CoverageStore.Stamp(99,0)),"live save during scan wins over recovered geometry");
+        try{index.rebuildIndex(world,()->true,p->{});throw new AssertionError("cancelled rebuild must stop");}catch(java.util.concurrent.CancellationException expected){}
+        index.saveAfterWorldClosed();index=new CoverageStore(path);index.remote(-4,32,64);((EngineAccess)world).distant$setCoverage(index);
+        check(index.directory(0,0,false)!=null,"rebuild persists directories without startup migration");
+        check(index.column(0,0,0,1).equals(new CoverageStore.Stamp(99,0)),"rebuild preserves version after disk reopen");
+        world.free();
+        var dispatcher=new com.mojang.brigadier.CommandDispatcher<net.minecraft.commands.CommandSourceStack>();
+        dev.voxydistant.client.CacheIndexRebuild.commands(new net.minecraftforge.client.event.RegisterClientCommandsEvent(dispatcher,null));
+        check(dispatcher.getRoot().getChild("voxydistant").getChild("rebuildindex")!=null,"client command registered without an OP requirement");
+        System.out.println("DISTANT_INDEX_REBUILD_PASS: real Voxy RocksDB with no coverage, false-ready marker, five LOD levels, AIR, force repeat, live save, unsafe guard, cancellation, reopen and client command");
     }
     private static LodColumn column(long revision,int level,int state){long[][][] sections=new long[1][5][];sections[0][level]=new long[4096>>(3*level)];Arrays.fill(sections[0][level],LodColumn.voxel(state,0,0xf3,state==0?0:15));return new LodColumn(-1,-1,0,revision,List.of(Blocks.AIR.defaultBlockState(),Blocks.STONE.defaultBlockState()),List.of("minecraft:plains"),sections);}
     private static void compareMipper(Mapper mapper){

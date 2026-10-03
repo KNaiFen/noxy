@@ -59,6 +59,10 @@ public final class RemoteClient {
         s.x=Integer.MIN_VALUE;s.discovery.reset();s.regionQueries.clear();
         if(!paused)s.fullRetry.addAll(s.versions.keySet());
     }
+    public static void indexRebuilt(WorldEngine world){
+        Session s=session;
+        if(s!=null&&s.engine==world)s.receive(()->{if(!s.closed){s.checked.clear();s.x=Integer.MIN_VALUE;s.discovery.reset();s.regionQueries.clear();}});
+    }
     private static final Map<Long,Long> initialVersions=new ConcurrentHashMap<>();
     private static final class Assembly {
         final Protocol.Fragment header;final byte[] bytes;final long reservation;final DebugLog.ReceiveTrace trace;int offset;

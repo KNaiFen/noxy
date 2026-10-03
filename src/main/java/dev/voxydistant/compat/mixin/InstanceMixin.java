@@ -18,5 +18,5 @@ public abstract class InstanceMixin {
         VoxyBridge.attach(cir.getReturnValue(), id);
     }
     @Inject(method = "shutdown", at = @At("HEAD"))
-    private void distant$stop(CallbackInfo ci) { dev.voxydistant.client.RemoteClient.shutdown(); GenerationController.beforeVoxyShutdown(); }
+    private void distant$stop(CallbackInfo ci) { dev.voxydistant.client.CacheIndexRebuild.shutdown(); dev.voxydistant.client.RemoteClient.shutdown(); GenerationController.beforeVoxyShutdown(); }
 }

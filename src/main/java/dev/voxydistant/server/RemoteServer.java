@@ -100,10 +100,6 @@ public final class RemoteServer {
     private volatile boolean maintenancePaused;
     private volatile Thread maintenanceScanner;
     private volatile boolean importStorageFailed;
-    private LodDatabase indexingDatabase;
-    private final ExecutorService indexReaders=Executors.newFixedThreadPool(6,r->{var t=new Thread(r,"Voxy Distant server index reader");t.setDaemon(true);t.setPriority(Thread.MIN_PRIORITY);return t;});
-    private boolean indexReading,indexFailed;
-    private long indexStarted,indexReported;
     private boolean exclusiveImport() { return maintenance!=null && maintenance.type==MaintenanceType.IMPORT; }
     private record ImportDimension(RegionNbtImporter parser, int minSection, int sections) {}
 
@@ -409,7 +405,6 @@ public final class RemoteServer {
         if(ticks%40==0)for(Session s:players.values())s.vanilla.removeIf(p->!ChunkMap.isChunkInRange(ChunkPos.getX(p),ChunkPos.getZ(p),s.player.chunkPosition().x,s.player.chunkPosition().z,server.getPlayerList().getViewDistance()));
         if(ticks==1 || ticks%40==0) for(Session s:players.values()) if(s.radius==0) hello(s.player);
         var limits=DistantConfig.serverLimits();
-        rebuildStartupIndex();
         if(workers.getCorePoolSize()!=limits.threads()) {
             workers.setMaximumPoolSize(Math.max(limits.threads(),workers.getCorePoolSize())); workers.setCorePoolSize(limits.threads()); workers.setMaximumPoolSize(limits.threads());
         }
@@ -491,28 +486,6 @@ public final class RemoteServer {
             }
             DebugLog.timings("SERVER");
         }
-    }
-    private void rebuildStartupIndex(){
-        if(configChange!=null||exclusiveImport()||importStorageFailed)return;
-        var db=database;
-        if(indexingDatabase!=db){
-            indexingDatabase=db;indexFailed=false;indexStarted=indexReported=System.nanoTime();
-            if(db.indexComplete())LOG.info("Voxy Distant 服务端索引已就绪，跳过重建");
-            else LOG.info("Voxy Distant 服务端开始补建旧 LOD 索引，无需玩家进入（6 线程，支持断点续建）");
-        }
-        if(db.indexComplete()||indexReading||indexFailed||workers.getQueue().size()>DistantConfig.SERVER_QUEUE.get()||dirtyWrites.get()>8)return;
-        indexReading=true;boolean idle=players.isEmpty();
-        workers.execute(()->{
-            try{
-                long deadline=System.nanoTime()+(idle?40_000_000L:2_000_000L);LodDatabase.IndexProgress progress;
-                do{progress=db.rebuildIndexStep(indexReaders);}while(!progress.complete()&&!stopping&&System.nanoTime()<deadline);
-                long now=System.nanoTime();
-                if(progress.complete())LOG.info("Voxy Distant 服务端旧 LOD 索引建立完成：检查 {} 列，缓存列数 {}，耗时 {} ms；后续启动跳过重建",progress.columns(),db.cacheStats().columns(),(now-indexStarted)/1_000_000);
-                else if(now-indexReported>=TimeUnit.SECONDS.toNanos(5)){indexReported=now;db.sync();LOG.info("Voxy Distant 服务端旧 LOD 索引进度：已检查 {} 列，耗时 {} s",progress.columns(),(now-indexStarted)/1_000_000_000);}
-                if(progress.complete())indexReaders.shutdown();
-                server.execute(()->indexReading=false);
-            }catch(RuntimeException e){server.execute(()->{indexReading=false;indexFailed=true;fail(new IllegalStateException("服务端启动索引失败；已提交进度保留，下次启动或重开缓存后继续",e));});}
-        });
     }
     private void complete(Runnable action){completions.add(action);queuePump();}
     private void queuePump(){
@@ -1631,7 +1604,6 @@ public final class RemoteServer {
         try{while(!s.workers.awaitTermination(1,TimeUnit.SECONDS))LOG.debug("Waiting for server LOD writes");}
         catch(InterruptedException ex){Thread.currentThread().interrupt();throw new IllegalStateException(ex);}
         s.completions.clear();
-        s.indexReaders.shutdown();
         if(scanner!=null)try{scanner.join();}catch(InterruptedException ex){Thread.currentThread().interrupt();throw new IllegalStateException(ex);}
         if(s.maintenance!=null){s.maintenance.queue.clear();s.maintenance.pending.clear();s.maintenance.active=0;}
         for(var w:s.work.values())w.snapshots.clear();s.work.clear();s.memory=0;
