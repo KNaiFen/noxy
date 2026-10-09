@@ -49,6 +49,8 @@ repositories {
         dirs("libs")
     }
 
+    mavenLocal()
+
     maven {
         url = uri("https://artifex.soh.gg/maven/m3t4f1v3/bp-voxy-packages/")
     }
