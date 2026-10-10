@@ -1,0 +1,58 @@
+{
+  "voxy.config.title": "Voxy",
+
+  "voxy.config.general": "常规",
+  "voxy.config.rendering": "渲染",
+
+  "voxy.config.general.enabled": "启用 Voxy",
+  "voxy.config.general.enabled.tooltip": "完全启用或关闭 Voxy。",
+
+  "voxy.config.general.serviceThreads": "后台工作线程数",
+  "voxy.config.general.serviceThreads.tooltip": "Voxy 后台任务可使用的专用线程数量。",
+
+  "voxy.config.general.useSodiumBuilder": "共用区块构建线程",
+  "voxy.config.general.useSodiumBuilder.tooltip": "让 Voxy 共用 Sodium / Embeddium 的区块构建线程。在较高渲染距离下快速移动时，有助于减少卡顿。",
+
+  "voxy.config.general.ingest": "摄入区块（生成远景）",
+  "voxy.config.general.ingest.tooltip": "将新加载的区块转换为 LOD 远景数据。关闭后不再摄入新区块，已有远景仍可渲染。",
+
+  "voxy.config.general.rendering": "渲染 Voxy 远景",
+  "voxy.config.general.rendering.tooltip": "启用或关闭 Voxy 远景渲染。",
+
+  "voxy.config.general.subDivisionSize": "细节细分阈值（像素²）",
+  "voxy.config.general.subDivisionSize.tooltip": "远景区域在屏幕上的包围盒面积超过此值时，会细分为更精细的 LOD。数值越小，画质越高。",
+
+  "voxy.config.general.renderDistance": "远景渲染距离",
+  "voxy.config.general.renderDistance.tooltip": "Voxy 远景的渲染距离，单位为区块。",
+
+  "voxy.config.general.environmental_fog": "启用环境雾",
+  "voxy.config.general.environmental_fog.tooltip": "启用或关闭 Voxy 远景中的环境雾效。",
+
+  "voxy.config.general.ssao_mode": "环境光遮蔽（SSAO）",
+  "voxy.config.general.ssao_mode.tooltip": "屏幕空间环境光遮蔽的质量模式。“自动”会尽量选择合适的效果并降低性能开销。",
+  "voxy.config.general.ssao_mode.auto": "自动",
+  "voxy.config.general.ssao_mode.basic": "基础",
+  "voxy.config.general.ssao_mode.better": "较好",
+  "voxy.config.general.ssao_mode.best": "最佳",
+
+  "voxy.config.general.adaptCloudDistance": "云距离随远景调整",
+  "voxy.config.general.adaptCloudDistance.tooltip": "根据当前远景渲染距离扩展云的渲染范围，最高为 256 区块。",
+  "voxy.config.general.cloudDistance": "云渲染距离",
+  "voxy.config.general.cloudDistance.tooltip": "云的渲染距离，单位为区块。仅在关闭自动调整云距离时生效。",
+  "voxy.config.general.cloudDistance.adaptive": "自动调整",
+  "voxy.config.general.cloudDistance.default": "默认",
+
+  "voxy.config.general.fogIntensity": "雾效强度",
+  "voxy.config.general.fogIntensity.tooltip": "地形雾不透明度的倍率：0.0 为关闭，1.0 为原版强度，3.0 为三倍强度。",
+  "voxy.config.general.fogDensity": "雾效变化曲线",
+  "voxy.config.general.fogDensity.tooltip": "控制雾浓度随距离变化的曲线。0.0 为线性；数值越大，雾越集中在远处。",
+  "voxy.config.general.skyFogDistance": "天空雾距离",
+  "voxy.config.general.skyFogDistance.tooltip": "数值越大，天空雾的过渡越锐利。单位为区块。",
+
+  "voxy.command.error.disabled": "请先在设置中启用 Voxy，再使用此功能。",
+  "voxy.command.error.singleplayer": "此命令只能在单人世界中使用。",
+  "voxy.command.error.region": "找不到当前维度的 region 地形目录。",
+  "voxy.import.title": "Voxy 世界导入",
+  "voxy.import.progress": "Voxy 导入：%s/%s 区块",
+  "voxy.import.completed": "Voxy 世界导入完成，用时 %s 秒，平均每秒 %s 区块。"
+}

@@ -79,7 +79,7 @@ public class VoxyCommands {
         private static int reloadInstance(CommandContext<CommandSourceStack> ctx) {
         var instance = (VoxyClientInstance)VoxyCommon.getInstance();
         if (instance == null) {
-            sendErrorToPlayer(Component.translatable("Voxy must be enabled in settings to use this"));
+            sendErrorToPlayer(Component.translatable("voxy.command.error.disabled"));
             return 1;
         }
         var wr = Minecraft.getInstance().levelRenderer;
@@ -99,7 +99,7 @@ public class VoxyCommands {
     private static int verifyTLNs(CommandContext<CommandSourceStack> ctx, boolean attemptRepair) {
         var instance = VoxyCommon.getInstance();
         if (instance == null) {
-            sendErrorToPlayer(Component.translatable("Voxy must be enabled in settings to use this"));
+            sendErrorToPlayer(Component.translatable("voxy.command.error.disabled"));
             return 1;
         }
         if (Minecraft.getInstance().level == null) {
@@ -113,7 +113,7 @@ public class VoxyCommands {
     private static int importDistantHorizons(CommandContext<CommandSourceStack> ctx) {
         var instance = (VoxyClientInstance)VoxyCommon.getInstance();
         if (instance == null) {
-            sendErrorToPlayer(Component.translatable("Voxy must be enabled in settings to use this"));
+            sendErrorToPlayer(Component.translatable("voxy.command.error.disabled"));
             return 1;
         }
         var dbFile = new File(ctx.getArgument("sqlDbPath", String.class));
@@ -151,7 +151,7 @@ public class VoxyCommands {
 
     private static int importRaw(CommandContext<CommandSourceStack> ctx) {
         if (VoxyCommon.getInstance() == null) {
-            sendErrorToPlayer(Component.translatable("Voxy must be enabled in settings to use this"));
+            sendErrorToPlayer(Component.translatable("voxy.command.error.disabled"));
             return 1;
         }
 
@@ -160,7 +160,7 @@ public class VoxyCommands {
 
     private static int importBobby(CommandContext<CommandSourceStack> ctx) {
         if (VoxyCommon.getInstance() == null) {
-            sendErrorToPlayer(Component.translatable("Voxy must be enabled in settings to use this"));
+            sendErrorToPlayer(Component.translatable("voxy.command.error.disabled"));
             return 1;
         }
 
@@ -220,18 +220,18 @@ public class VoxyCommands {
 
     private static int importCurrentWorldIn(CommandContext<CommandSourceStack> ctx) {
         if (VoxyCommon.getInstance() == null) {
-            sendErrorToPlayer(Component.translatable("Voxy must be enabled in settings to use this"));
+            sendErrorToPlayer(Component.translatable("voxy.command.error.disabled"));
             return 1;
         }
 
         var localServer = Minecraft.getInstance().getSingleplayerServer();
         if (localServer == null) {
-            sendErrorToPlayer(Component.translatable("You must be in single player to use this command"));
+            sendErrorToPlayer(Component.translatable("voxy.command.error.singleplayer"));
             return 1;
         }
         var regionPath = DimensionType.getStorageFolder(Minecraft.getInstance().level.dimension(), localServer.getWorldPath(LevelResource.ROOT)).resolve("region");
         if ((!regionPath.toFile().exists())||!regionPath.toFile().isDirectory()) {
-            sendErrorToPlayer(Component.translatable("Cannot find region folder for current dimension"));
+            sendErrorToPlayer(Component.translatable("voxy.command.error.region"));
             return 1;
         }
         return fileBasedImporter(regionPath.toFile())?0:1;
@@ -239,7 +239,7 @@ public class VoxyCommands {
 
     private static int importWorld(CommandContext<CommandSourceStack> ctx) {
         if (VoxyCommon.getInstance() == null) {
-            sendErrorToPlayer(Component.translatable("Voxy must be enabled in settings to use this"));
+            sendErrorToPlayer(Component.translatable("voxy.command.error.disabled"));
             return 1;
         }
 
@@ -285,7 +285,7 @@ public class VoxyCommands {
 
         var instance = (VoxyClientInstance)VoxyCommon.getInstance();
         if (instance == null) {
-            sendErrorToPlayer(Component.translatable("Voxy must be enabled in settings to use this"));
+            sendErrorToPlayer(Component.translatable("voxy.command.error.disabled"));
             return 1;
         }
         String finalInnerDir = innerDir;
@@ -304,7 +304,7 @@ public class VoxyCommands {
     private static int cancelImport(CommandContext<CommandSourceStack> ctx) {
         var instance = (VoxyClientInstance)VoxyCommon.getInstance();
         if (instance == null) {
-            sendErrorToPlayer(Component.translatable("Voxy must be enabled in settings to use this"));
+            sendErrorToPlayer(Component.translatable("voxy.command.error.disabled"));
             return 1;
         }
         var world = WorldIdentifier.ofEngineNullable(Minecraft.getInstance().level);
